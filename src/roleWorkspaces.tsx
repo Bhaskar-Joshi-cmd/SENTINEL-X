@@ -122,7 +122,7 @@ export function RoleWorkspace(props: Props) {
       {role === 'disaster_authority' && <DisasterAuthorityPanel {...props} />}
       {role === 'village_authority' && <VillageAuthorityPanel {...props} />}
       {role === 'community_member' && <CommunityMemberPanel {...props} />}
-      {role === 'admin' && <AdminPanel {...props} />}
+      {role === 'admin' && <AdminPanel />}
     </div>
   )
 }

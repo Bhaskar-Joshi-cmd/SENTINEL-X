@@ -187,6 +187,12 @@ export function getHydroReadings(stationCode: string, limit = 50) {
   )
 }
 
+export function getInboundSummary(riverCode: string, limit = 50) {
+  return apiRequest<InboundSummary>(
+    `/inbound/summary?river_code=${encodeURIComponent(riverCode)}&limit=${limit}`,
+  )
+}
+
 export function getActiveAlerts() {
   return apiRequest<{ items: Alert[] }>('/alerts/active')
 }
@@ -210,6 +216,129 @@ export function startReplay(riverCode: string, payload: { station_code?: string;
   })
 }
 
+
+
+export type InboundHydroRecord = HydroReading & {
+  station_code: string
+  station_name: string
+  river_name?: string | null
+}
+
+export type InboundSensorRecord = {
+  id: string
+  sensor_id: string
+  sensor_code: string
+  sensor_type: string
+  numeric_value: number | null
+  unit: string | null
+  observed_at: string
+  battery_percentage?: number | null
+  latitude?: number | null
+  longitude?: number | null
+  quality_score?: number | null
+  station_id?: string | null
+  station_name?: string | null
+  station_code?: string | null
+  river_name?: string | null
+}
+
+export type InboundCommunityRecord = {
+  id: string
+  report_code: string
+  village_id: string
+  village_name?: string | null
+  station_id: string
+  station_name?: string | null
+  station_code?: string | null
+  submitted_at: string
+  report_type: string
+  description?: string | null
+  severity: string
+  verification_status: string
+  trust_score?: number | null
+  latitude?: number | null
+  longitude?: number | null
+}
+
+export type InboundEvaluationRecord = RuleEvaluation & {
+  station_name?: string | null
+  station_code?: string | null
+  river_name?: string | null
+}
+
+export type InboundSummary = {
+  river: River
+  counts: {
+    hydro: number
+    sensors: number
+    community: number
+    evaluations: number
+  }
+  latest_received_at: string | null
+  hydro: InboundHydroRecord[]
+  sensors: InboundSensorRecord[]
+  community: InboundCommunityRecord[]
+  evaluations: InboundEvaluationRecord[]
+}
+
+export type DeliveryRecord = {
+  id: string
+  village_id: string
+  channel: string
+  delivery_status: string
+  attempt_number?: number | null
+  sent_at?: string | null
+  delivered_at?: string | null
+  acknowledged_at?: string | null
+  failure_reason?: string | null
+  is_simulated?: boolean | null
+  metadata?: Record<string, unknown> | null
+}
+
+export type AlertTarget = {
+  id: string
+  alert_id: string
+  village_id: string
+  risk_score?: number | null
+  time_to_impact_minutes?: number | null
+  target_priority?: string | null
+  target_status?: string | null
+}
+
+export type VillageDeliveryRow = {
+  village: Village
+  impact: ImpactAssessment | null
+  target: AlertTarget | null
+  deliveries: DeliveryRecord[]
+  delivery_state: string
+  route: string[]
+  is_simulated_delivery: boolean
+}
+
+export type VillageDeliverySummary = {
+  river: River
+  stations: Array<{
+    id: string
+    station_code: string
+    station_name: string
+    river_name?: string | null
+  }>
+  alert: Alert | null
+  event_id: string | null
+  summary: {
+    villages: number
+    targeted: number
+    delivered: number
+    deliveries: number
+  }
+  villages: VillageDeliveryRow[]
+}
+
+export function getVillageDeliverySummary(riverCode: string) {
+  return apiRequest<VillageDeliverySummary>(
+    `/village-delivery/summary?river_code=${encodeURIComponent(riverCode)}`,
+  )
+}
 
 export type CommunityReport = {
   id: string
