@@ -95,6 +95,16 @@ local.properties
 *.swp
 *.swo
 
+# Editor / agent "save a copy before editing" backups
+*.before-*
+*.before
+*.orig
+*.rej
+
+# Ad-hoc local diagnostic scripts (not part of the application)
+server/probe_*.py
+scripts/probe_*.py
+
 
 # =========================================================
 # PROJECT-SPECIFIC LOCAL FILES
@@ -103,3 +113,6 @@ local.properties
 # Backup files created during development
 *.backup
 *.bak
+
+# Committed Windows build output (from a Windows dev machine).
+# Remove from the index once with: git rm -r --cached 'android/C:'
