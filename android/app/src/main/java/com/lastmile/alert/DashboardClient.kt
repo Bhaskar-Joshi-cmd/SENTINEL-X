@@ -3,8 +3,10 @@ package com.lastmile.alert
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 
 class DashboardClient {
+
     data class Station(
         val name: String,
         val river: String,
@@ -12,9 +14,15 @@ class DashboardClient {
     )
 
     data class Alert(
+        val id: String,
         val title: String,
         val priority: String,
-        val status: String
+        val status: String,
+        // Kept for the auto-relay so the message forwarded to a phone carries
+        // real backend wording instead of a hardcoded village/ETA string.
+        val description: String = "",
+        val instruction: String = "",
+        val createdAt: String = ""
     )
 
     data class Evaluation(
@@ -28,63 +36,154 @@ class DashboardClient {
         val evaluations: List<Evaluation>
     )
 
-    fun loadSummary(onResult: (Result<Summary>) -> Unit) {
+    /**
+     * @param baseUrl backend base URL (for example
+     *   `http://192.168.0.105:8000/api`). Passed in rather than read from
+     *   BuildConfig so the address can be corrected on the device at runtime —
+     *   the host IP changes with the Wi-Fi network, and rebuilding the APK for
+     *   every new address is not practical.
+     */
+    fun loadSummary(baseUrl: String, onResult: (Result<Summary>) -> Unit) {
         Thread {
             val result = runCatching {
-                val baseUrl = BuildConfig.SUPABASE_URL.trim().trimEnd('/')
-                val headers = mapOf(
-                    "apikey" to BuildConfig.SUPABASE_ANON_KEY,
-                    "Authorization" to "Bearer ${BuildConfig.SUPABASE_ANON_KEY}"
-                )
-                val stationsJson = getJson("$baseUrl/rest/v1/hydro_stations?select=id,station_name,river_name,station_code&station_code=in.(CWC_MELLI,CWC_NANGLAMORAGHAT)", headers)
-                val readingsJson = getJson("$baseUrl/rest/v1/hydro_readings?select=station_id,water_level_m,observed_at&order=observed_at.desc&limit=20", headers)
-                val alertsJson = getJson("$baseUrl/rest/v1/alerts?select=title,priority,status&status=in.(pending_approval,approved,dispatching,active)&order=created_at.desc&limit=20", headers)
-                val evaluationsJson = getJson("$baseUrl/rest/v1/rule_evaluations?select=risk_level,total_score&order=evaluated_at.desc&limit=20", headers)
+                val cleanedBaseUrl = baseUrl
+                    .trim()
+                    .trimEnd('/')
 
-                val readingByStation = mutableMapOf<String, String>()
-                for (index in 0 until readingsJson.length()) {
-                    val item = readingsJson.optJSONObject(index) ?: continue
-                    val stationId = item.optString("station_id")
-                    if (stationId !in readingByStation) readingByStation[stationId] = item.optString("water_level_m", "n/a")
+                if (cleanedBaseUrl.isEmpty()) {
+                    error("Backend URL is empty. Enter the address shown in the API URL field.")
                 }
-                Summary(
-                    stations = buildList {
-                        for (index in 0 until stationsJson.length()) {
-                            val item = stationsJson.optJSONObject(index) ?: continue
-                            add(Station(item.optString("station_name", "Unknown station"), item.optString("river_name", "Unknown river"), readingByStation[item.optString("id")] ?: "n/a"))
-                        }
-                    },
-                    alerts = buildList {
-                        for (index in 0 until alertsJson.length()) {
-                            val item = alertsJson.optJSONObject(index) ?: continue
-                            add(Alert(item.optString("title", "Untitled alert"), item.optString("priority", "P3"), item.optString("status", "unknown")))
-                        }
-                    },
-                    evaluations = buildList {
-                        for (index in 0 until evaluationsJson.length()) {
-                            val item = evaluationsJson.optJSONObject(index) ?: continue
-                            add(Evaluation(item.optString("risk_level", "watch"), item.optString("total_score", "n/a")))
-                        }
+
+                val response = getJson("$cleanedBaseUrl/android/overview")
+
+                val stationsJson = response.optJSONArray("stations")
+                    ?: org.json.JSONArray()
+
+                val alertsJson = response.optJSONArray("active_alerts")
+                    ?: org.json.JSONArray()
+
+                val evaluationJson = response.optJSONObject("latest_evaluation")
+
+                val stations = buildList {
+                    for (index in 0 until stationsJson.length()) {
+                        val item = stationsJson.optJSONObject(index) ?: continue
+                        val reading = item.optJSONObject("latest_reading")
+
+                        add(
+                            Station(
+                                name = item.optString(
+                                    "station_name",
+                                    "Unknown station"
+                                ),
+                                river = item.optString(
+                                    "river_name",
+                                    "Unknown river"
+                                ),
+                                waterLevel = reading?.optString(
+                                    "water_level_m",
+                                    "n/a"
+                                ) ?: "n/a"
+                            )
+                        )
                     }
+                }
+
+                val alerts = buildList {
+                    for (index in 0 until alertsJson.length()) {
+                        val item = alertsJson.optJSONObject(index) ?: continue
+
+                        add(
+                            Alert(
+                                id = item.optString("id", UUID.randomUUID().toString()),
+                                title = item.optString(
+                                    "title",
+                                    "Untitled alert"
+                                ),
+                                priority = item.optString(
+                                    "priority",
+                                    "P3"
+                                ),
+                                status = item.optString(
+                                    "status",
+                                    "unknown"
+                                ),
+                                description = item.optString("description", ""),
+                                instruction = item.optString("instruction", ""),
+                                createdAt = item.optString("created_at", "")
+                            )
+                        )
+                    }
+                }
+
+                val evaluations = buildList {
+                    evaluationJson?.let { item ->
+                        add(
+                            Evaluation(
+                                riskLevel = item.optString(
+                                    "risk_level",
+                                    "unknown"
+                                ),
+                                score = item.optString(
+                                    "total_score",
+                                    "n/a"
+                                )
+                            )
+                        )
+                    }
+                }
+
+                Summary(
+                    stations = stations,
+                    alerts = alerts,
+                    evaluations = evaluations
                 )
             }
+
             onResult(result)
         }.start()
     }
 
-    private fun getJson(url: String, headers: Map<String, String>): org.json.JSONArray {
+    private fun getJson(url: String): JSONObject {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 10_000
             readTimeout = 10_000
-            headers.forEach { (name, value) -> setRequestProperty(name, value) }
         }
+
         try {
             val responseCode = connection.responseCode
-            val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
-            val responseBody = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (responseCode !in 200..299) error("Supabase returned HTTP $responseCode: ${responseBody.take(180)}")
-            return org.json.JSONArray(responseBody)
+            val stream =
+                if (responseCode in 200..299) {
+                    connection.inputStream
+                } else {
+                    connection.errorStream
+                }
+
+            val responseBody =
+                stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+
+            if (responseCode !in 200..299) {
+                error(
+                    "FastAPI returned HTTP $responseCode: " +
+                        responseBody.take(250)
+                )
+            }
+
+            return JSONObject(responseBody)
+        } catch (e: java.net.SocketTimeoutException) {
+            // Most common local-network cause: the host is unreachable because
+            // the phone is on a different Wi-Fi, or nothing is listening.
+            error(
+                "Timed out reaching $url. Check the phone and Mac are on the same " +
+                    "Wi-Fi and that the backend is running on port 8000."
+            )
+        } catch (e: java.net.ConnectException) {
+            error(
+                "Cannot reach $url. Check the API URL matches the Mac's current " +
+                    "address (run: ipconfig getifaddr en0)."
+            )
+        } catch (e: java.net.UnknownHostException) {
+            error("Unknown host in $url. Use the Mac's numeric IP, not a hostname.")
         } finally {
             connection.disconnect()
         }

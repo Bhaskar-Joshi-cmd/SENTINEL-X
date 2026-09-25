@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">LastMile Alert Relay</string>
+    <string name="app_name">SENTINEL-X</string>
+    <string name="app_tagline">Resilient emergency warning and last-mile relay</string>
 </resources>

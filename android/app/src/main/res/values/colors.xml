@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SENTINEL-X light palette.
+  A community member must be able to read this on a cheap phone in daylight,
+  so surfaces are near-white and text is dark. Severity colours are the only
+  saturated colours in the app.
+-->
+<resources>
+    <!-- Surfaces and text -->
+    <color name="sx_page">#FFF6F8F9</color>
+    <color name="sx_surface">#FFFFFFFF</color>
+    <color name="sx_border">#FFE1E7E9</color>
+    <color name="sx_text">#FF0F1B1E</color>
+    <color name="sx_text_muted">#FF5A6B70</color>
+    <color name="sx_text_faint">#FF8A989D</color>
+
+    <!-- Brand -->
+    <color name="sx_brand">#FF0E7C6B</color>
+    <color name="sx_brand_dark">#FF075A4D</color>
+    <color name="sx_brand_soft">#FFE6F2EF</color>
+
+    <!-- Severity (green -> red) -->
+    <color name="sx_normal">#FF2E7D32</color>
+    <color name="sx_normal_soft">#FFE8F3E9</color>
+    <color name="sx_watch">#FF8A6D00</color>
+    <color name="sx_watch_soft">#FFFBF3DF</color>
+    <color name="sx_warning">#FFB26A00</color>
+    <color name="sx_warning_soft">#FFFDF0E2</color>
+    <color name="sx_high">#FFC2410C</color>
+    <color name="sx_high_soft">#FFFDEDE3</color>
+    <color name="sx_critical">#FFB3261E</color>
+    <color name="sx_critical_soft">#FFFBE9E7</color>
+</resources>

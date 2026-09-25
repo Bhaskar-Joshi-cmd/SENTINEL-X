@@ -8,7 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.graphics.Color
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -50,6 +51,33 @@ class MainActivity : AppCompatActivity() {
     private lateinit var emergencyStore: EmergencyStore
     private lateinit var dashboardClient: DashboardClient
     private var dashboardSummary: DashboardClient.Summary? = null
+
+    // Auto-refresh so the app tracks the same 10s cadence as the web stream.
+    // Previously loadSummary() ran only once in onCreate(), so the app froze at
+    // its launch values and could never agree with the live dashboard.
+    private val dashboardHandler = Handler(Looper.getMainLooper())
+    private var dashboardRefreshScheduled = false
+    private var dashboardRequestInFlight = false
+
+    // -----------------------------------------------------------------------
+    // Auto-relay: backend decision -> phone-to-phone relay.
+    //
+    // The rule engine only creates an alert once the score reaches 70 (high) or
+    // 85 (critical), so "a new dispatchable alert appeared" is the threshold
+    // trigger. We relay the newest alert once, remember its id, and ignore every
+    // later poll until a different alert shows up. Manual "Send relay alert"
+    // still works independently for operator override / retry.
+    // -----------------------------------------------------------------------
+    private var lastAutoRelayAlertId: String? = null
+    private var autoRelayEnabled = true
+    private val dashboardRefreshRunnable = object : Runnable {
+        override fun run() {
+            dashboardRefreshScheduled = false
+            if (isFinishing || isDestroyed) return
+            connectToDashboard(silent = true)
+            scheduleDashboardRefresh()
+        }
+    }
     private val connectedEndpoints = mutableSetOf<String>()
     private val endpointNames = mutableMapOf<String, String>()
     private val receivedAlertIds = mutableSetOf<String>()
@@ -59,6 +87,12 @@ class MainActivity : AppCompatActivity() {
     private var relayStarted = false
     private val defaultChainHops = 106
     private lateinit var session: SessionStore.Session
+
+    private companion object {
+        // Matches the web dashboard's 10s stream cadence so both surfaces
+        // converge on the same reading at roughly the same time.
+        const val DASHBOARD_REFRESH_MS = 10_000L
+    }
 
     private val lifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: com.google.android.gms.nearby.connection.ConnectionInfo) {
@@ -107,7 +141,7 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         alertsText = findViewById(R.id.alertsText)
         dashboardUrlInput = findViewById(R.id.dashboardUrlInput)
-        dashboardUrlInput.setText(BuildConfig.SUPABASE_URL)
+        dashboardUrlInput.setText(BuildConfig.DASHBOARD_API_URL)
         dashboardStatusText = findViewById(R.id.dashboardStatusText)
         roleText = findViewById(R.id.roleText)
         workspaceText = findViewById(R.id.workspaceText)
@@ -148,6 +182,12 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.sendButton).setOnClickListener { sendDemoAlert() }
         findViewById<Button>(R.id.dashboardButton).setOnClickListener { connectToDashboard() }
         connectToDashboard()
+        scheduleDashboardRefresh()
+    }
+
+    override fun onDestroy() {
+        cancelDashboardRefresh()
+        super.onDestroy()
     }
 
     private fun workspaceFor(role: String): String = when (role) {
@@ -158,26 +198,114 @@ class MainActivity : AppCompatActivity() {
         else -> "System administration / account oversight / relay health"
     }
 
-    private fun connectToDashboard() {
+    private fun scheduleDashboardRefresh() {
+        if (dashboardRefreshScheduled || isFinishing || isDestroyed) return
+        dashboardRefreshScheduled = true
+        dashboardHandler.postDelayed(dashboardRefreshRunnable, DASHBOARD_REFRESH_MS)
+    }
+
+    private fun cancelDashboardRefresh() {
+        dashboardRefreshScheduled = false
+        dashboardHandler.removeCallbacks(dashboardRefreshRunnable)
+    }
+
+    // `silent` is used by the 10s auto-refresh so the status line does not flash
+    // "connecting..." every cycle. A manual tap still shows progress, and errors
+    // are always surfaced.
+    private fun connectToDashboard(silent: Boolean = false) {
+        if (dashboardRequestInFlight) return
+        dashboardRequestInFlight = true
+
         val button = findViewById<Button>(R.id.dashboardButton)
-        button.isEnabled = false
-        dashboardStatusText.text = "Supabase: connecting..."
-        dashboardClient.loadSummary { result ->
+        if (!silent) {
+            button.isEnabled = false
+            dashboardStatusText.text = "FastAPI: connecting..."
+        }
+        // Read the URL from the field so it can be corrected on the device. The
+        // Mac's address changes whenever it joins a different network, and
+        // rebuilding the APK each time is impractical.
+        val requestedUrl = dashboardUrlInput.text.toString().trim()
+        dashboardClient.loadSummary(requestedUrl) { result ->
             runOnUiThread {
-                button.isEnabled = true
+                dashboardRequestInFlight = false
+                if (!isFinishing && !isDestroyed) {
+                    button.isEnabled = true
+                }
                 result.onSuccess { summary ->
                     dashboardSummary = summary
                     dashboardStatusText.text = if (summary.stations.isEmpty() && summary.alerts.isEmpty() && summary.evaluations.isEmpty()) {
-                        "Supabase: connected, but anon key can see no rows / check RLS policies"
+                        "FastAPI: connected, but no dashboard rows were returned"
                     } else {
-                        "Supabase: connected / ${summary.stations.size} stations / ${summary.alerts.size} alerts"
+                        "FastAPI: connected / ${summary.stations.size} stations / ${summary.alerts.size} alerts / $requestedUrl"
                     }
+                    // A fresh, severe backend alert is the automatic relay
+                    // trigger. Runs after the UI render so the dashboard always
+                    // updates first.
+                    maybeAutoRelay(summary)
                     renderRoleWorkspace(session)
                 }.onFailure { error ->
-                    dashboardStatusText.text = "Supabase: connection failed / ${error.message ?: "check Supabase URL, key, and RLS"}"
+                    // On a background tick a single failure should surface but
+                    // must not kill the loop; the next tick retries. Echo the URL
+                    // that was attempted so a wrong address is obvious.
+                    dashboardStatusText.text = "FastAPI: failed / ${error.message ?: "unknown error"} / tried $requestedUrl"
                 }
             }
         }
+    }
+
+    /**
+     * Fires the phone-to-phone relay when the backend produces a new alert that
+     * is severe enough to dispatch. Called after every successful dashboard
+     * poll; the [lastAutoRelayAlertId] guard makes it idempotent, so a 10s poll
+     * loop does not re-send the same warning to the chain.
+     */
+    private fun maybeAutoRelay(summary: DashboardClient.Summary) {
+        if (!autoRelayEnabled) return
+
+        val alert = summary.alerts.firstOrNull() ?: return
+        if (!isDispatchable(alert)) return
+
+        // Idempotent: the same backend alert must reach the chain only once,
+        // otherwise the 10s poll loop would re-broadcast it forever.
+        if (alert.id == lastAutoRelayAlertId) return
+        lastAutoRelayAlertId = alert.id
+
+        val station = summary.stations.firstOrNull()
+        val location = when {
+            station == null -> "monitored basin"
+            station.river.isNotBlank() -> "${station.river} / ${station.name}"
+            else -> station.name
+        }
+        val body = alert.instruction.ifBlank {
+            alert.description.ifBlank { "Follow local disaster-management instructions." }
+        }
+
+        // 7-part wire format matches receiveAndRelay()/forwardToNextHop():
+        // id | priority | hazard | location | message | hopsRemaining | visitedNames
+        val message = buildString {
+            append(alert.id).append('|')
+            append(alert.priority).append('|')
+            append("FLASH FLOOD").append('|')
+            append(location.replace('|', ' ')).append('|')
+            append(body.replace('|', ' ')).append('|')
+            append(defaultChainHops).append('|')
+            append(deviceName())
+        }
+
+        updateStatus("Auto relay: new ${alert.priority} alert from backend")
+        receiveAndRelay(message, null)
+    }
+
+    /**
+     * The rule engine's alert threshold is 70 (high). Anything lower is
+     * monitoring-only and must not reach a phone automatically, which is why
+     * only P0/P1 (and their critical/high severities) are dispatchable.
+     */
+    private fun isDispatchable(alert: DashboardClient.Alert): Boolean {
+        val priority = alert.priority.uppercase()
+        if (priority == "P0" || priority == "P1") return true
+        val severity = alert.status.lowercase()
+        return severity.contains("critical") || severity.contains("high")
     }
 
     private fun renderRoleWorkspace(session: SessionStore.Session) {
@@ -195,88 +323,347 @@ class MainActivity : AppCompatActivity() {
         val data = dashboardSummary
         val station = data?.stations?.firstOrNull()
         val evaluation = data?.evaluations?.firstOrNull()
-        addSection("SITUATION OVERVIEW", if (data == null) {
-            "No dashboard data loaded\nTap Connect to dashboard"
-        } else {
-            "${data.alerts.size} active alert(s)\n${station?.river ?: "No river"} / ${station?.name ?: "No station"}\nRisk ${evaluation?.riskLevel ?: "unknown"} / ${evaluation?.score ?: "n/a"}\nWater level: ${station?.waterLevel ?: "n/a"}"
-        })
+
+        // The one thing an operator must not have to hunt for: the current band.
+        addRiskBanner(
+            riskLevel = evaluation?.riskLevel ?: "normal",
+            headline = bandLabel(evaluation?.riskLevel),
+            detail = if (data == null) "No data loaded" else "${station?.river ?: "Unknown river"} · ${station?.name ?: "No station"}",
+        )
+
+        addLabel("Current situation")
+        addMetric("Water level", station?.waterLevel ?: "—")
+        addMetric("Active alerts", "${data?.alerts?.size ?: 0}")
+        addMetric("Risk score", evaluation?.score ?: "—")
+
         val pending = emergencyStore.pendingAlerts().firstOrNull()
         val remoteAlert = data?.alerts?.firstOrNull()
-        addSection("ALERT QUEUE", remoteAlert?.let { "${it.priority} / ${it.title}\nStatus: ${it.status}" }
-            ?: pending?.let { "${it.severity} / ${it.title}\n${it.village}\n${it.message}\nStatus: ${it.status}" }
-            ?: "No alerts loaded")
-        pending?.let { alert ->
-            addAction("Approve public warning") { emergencyStore.updateAlertStatus(alert.id, "APPROVED", session.username); renderRoleWorkspace(session) }
-            addAction("Reject / dismiss") { emergencyStore.updateAlertStatus(alert.id, "DISMISSED", session.username); renderRoleWorkspace(session) }
+
+        addLabel("Alert queue")
+        // The remote alert and the local pending alert are different types, so
+        // they are rendered separately rather than merged.
+        when {
+            remoteAlert != null -> addCard("${remoteAlert.title}\n${remoteAlert.priority} · ${remoteAlert.status}")
+            pending != null -> addCard("${pending.title}\n${pending.severity} · ${pending.village}\n${pending.message}")
+            else -> addCard("No alerts waiting.")
         }
-        addSection("IMPACT", "Japisagiya Gaon  /  Critical  /  15 min\nDesang Deroi Habi  /  Critical  /  30 min\nRajan Bagan  /  High  /  45 min")
-        addSection("COMMUNICATION", "Internet  Operational\nCellular  Operational\nMesh  Standby")
+        pending?.let { alert ->
+            addPrimaryAction("Approve warning") {
+                emergencyStore.updateAlertStatus(alert.id, "APPROVED", session.username)
+                updateStatus("Warning approved and queued for relay")
+                renderRoleWorkspace(session)
+            }
+            addSecondaryAction("Reject / dismiss") {
+                emergencyStore.updateAlertStatus(alert.id, "DISMISSED", session.username)
+                updateStatus("Warning dismissed")
+                renderRoleWorkspace(session)
+            }
+        }
+
+        addLabel("Villages at risk")
+        // Sample values stand in for the impact engine until the trigger
+        // backend is wired; the shape matches impact_assessments.
+        addVillageRow("Japisagiya Gaon", "CRITICAL", "15 min", "critical")
+        addVillageRow("Desang Deroi Habi", "CRITICAL", "30 min", "critical")
+        addVillageRow("Rajan Bagan", "HIGH", "45 min", "high")
+
+        addLabel("Relay")
+        addMetric("Nearby nodes", "${connectedEndpoints.size}")
+        addCard(if (relayStarted) "Relay active." else "Relay stopped. Start it below to hop alerts phone to phone.")
     }
 
     private fun renderDisasterAuthority(session: SessionStore.Session) {
         val data = dashboardSummary
-        val stationNames = data?.stations?.joinToString(", ") { it.name }
-        addSection("REGIONAL SITUATION", if (data == null) {
-            "No dashboard data loaded\nTap Connect to dashboard"
-        } else {
-            "${data.alerts.size} active alert(s)\n${data.stations.size} monitoring station(s)\nStations: ${stationNames ?: "none"}\nLatest risk: ${data.evaluations.firstOrNull()?.riskLevel ?: "unknown"}"
-        })
+        val evaluation = data?.evaluations?.firstOrNull()
+
+        addRiskBanner(
+            riskLevel = evaluation?.riskLevel ?: "normal",
+            headline = bandLabel(evaluation?.riskLevel),
+            detail = "Regional situation across monitored basins",
+        )
+
+        addLabel("Region")
+        addMetric("Stations", "${data?.stations?.size ?: 0}")
+        addMetric("Active alerts", "${data?.alerts?.size ?: 0}")
+        addMetric("Villages at risk", "3")
+        addMetric("People at risk", "5,004")
+
         val pending = emergencyStore.pendingAlerts().firstOrNull()
         val remoteAlert = data?.alerts?.firstOrNull()
-        addSection("APPROVAL QUEUE", remoteAlert?.let { "${it.priority} / ${it.title}\nStatus: ${it.status}" }
-            ?: pending?.let { "${it.severity} / ${it.title}\nStatus: ${it.status}" }
-            ?: "Approval queue is clear")
-        pending?.let { alert ->
-            addAction("Approve regional warning") { emergencyStore.updateAlertStatus(alert.id, "APPROVED", session.username); renderRoleWorkspace(session) }
-            addAction("Request more information") { emergencyStore.updateAlertStatus(alert.id, "INFO_REQUESTED", session.username); renderRoleWorkspace(session) }
+
+        addLabel("Approval queue")
+        when {
+            remoteAlert != null -> addCard("${remoteAlert.title}\n${remoteAlert.priority} · ${remoteAlert.status}")
+            pending != null -> addCard("${pending.title}\n${pending.severity} · ${pending.status}")
+            else -> addCard("Approval queue is clear.")
         }
-        addSection("REGIONAL IMPACT", "Japisagiya Gaon  2,845 people  15 min  Critical\nDesang Deroi Habi  1,204 people  30 min  Critical\nRajan Bagan  955 people  45 min  High")
-        addSection("COMMUNICATION OVERVIEW", "Internet  Available\nCellular  Available\nMesh  Ready for failover")
+        pending?.let { alert ->
+            addPrimaryAction("Approve regional warning") {
+                emergencyStore.updateAlertStatus(alert.id, "APPROVED", session.username)
+                updateStatus("Regional warning approved")
+                renderRoleWorkspace(session)
+            }
+            addSecondaryAction("Request more information") {
+                emergencyStore.updateAlertStatus(alert.id, "INFO_REQUESTED", session.username)
+                updateStatus("More information requested")
+                renderRoleWorkspace(session)
+            }
+        }
+
+        addLabel("Communication")
+        addCard("Internet and cellular available. Offline mesh ready for failover.")
     }
 
     private fun renderVillageAuthority(session: SessionStore.Session) {
         val alert = emergencyStore.latestAlert()
         val remoteAlert = dashboardSummary?.alerts?.firstOrNull()
-        val station = dashboardSummary?.stations?.firstOrNull()
-        addSection("MY VILLAGE / LOCAL AREA", "Station: ${station?.name ?: "Not loaded"}\nRiver: ${station?.river ?: "Not loaded"}\nWater level: ${station?.waterLevel ?: "n/a"}")
-        addSection("CURRENT WARNING", remoteAlert?.let { "${it.title.uppercase()}\nPriority: ${it.priority}\nStatus: ${it.status}" }
-            ?: alert?.let { "${it.title.uppercase()}\n${it.message}\nPriority: ${it.severity}" }
-            ?: "No active warning")
-        alert?.let { addAction("Village authority received warning") { emergencyStore.acknowledge(it.id, session.username); updateStatus("Warning acknowledgement saved locally") } }
-        addSection("LOCAL COMMUNICATION", "Internet  Available\nCellular  Available\nOffline mesh  Standby")
-        addAction("Report local situation") { showReportDialog(session) }
-        addSection("REPORTS SAVED", "${emergencyStore.reports().count { it.village == "Japisagiya Gaon" }} local report(s) awaiting sync")
+
+        // Village-level only. Basin-wide station data is the Control Room's job.
+        val band = remoteAlert?.priority ?: alert?.severity ?: "NORMAL"
+        addRiskBanner(
+            riskLevel = band,
+            headline = if (remoteAlert == null && alert == null) "No active warning" else "WARNING",
+            detail = "Japisagiya Gaon",
+        )
+
+        addLabel("Current warning")
+        addCard(
+            remoteAlert?.let { "${it.title}\n${it.priority} · ${it.status}" }
+                ?: alert?.let { "${it.title}\n${it.message}" }
+                ?: "There is no active warning for your village right now."
+        )
+
+        alert?.let {
+            addPrimaryAction("I received this warning") {
+                emergencyStore.acknowledge(it.id, session.username)
+                updateStatus("Warning acknowledgement saved locally")
+            }
+        }
+
+        addLabel("What to do")
+        addCard("Move toward the designated safe area.\nKeep your phone charged.\nFollow instructions from the village authority.\nDo not return until cleared.")
+
+        addLabel("Local communication")
+        addCard("Internet and cellular available. Offline mesh on standby.")
+
+        addSecondaryAction("Report local situation") { showReportDialog(session) }
+
+        addLabel("Reports")
+        addMetric("Awaiting sync", "${emergencyStore.reports().count { it.village == "Japisagiya Gaon" }}")
     }
 
     private fun renderCommunityMember(session: SessionStore.Session) {
         val alert = emergencyStore.latestAlert()
         val remoteAlert = dashboardSummary?.alerts?.firstOrNull()
-        addSection("EMERGENCY INFORMATION", remoteAlert?.let { "${it.priority} WARNING\n${it.title}\nStatus: ${it.status}" }
-            ?: alert?.let { "${it.severity} WARNING\n${it.title}\n${it.message}" }
-            ?: "No active emergency warning")
-        addSection("WHAT TO DO", "Move toward the designated safe area.\nKeep your phone charged.\nFollow village authority instructions.\nDo not return until cleared.")
-        alert?.let { addAction("I received this warning") { emergencyStore.acknowledge(it.id, session.username); updateStatus("Alert receipt saved locally") } }
-        addAction("Report an emergency") { showReportDialog(session) }
-        addSection("MY VILLAGE", "Japisagiya Gaon\nNearest safe area: Community high ground\nMesh relay: Available")
+
+        // A resident sees no score, no band vocabulary, no station data.
+        // Just: is there a warning, what to do, and two actions.
+        val headline = if (remoteAlert == null && alert == null) "No warning" else "WARNING"
+        val riskLevel = remoteAlert?.priority ?: alert?.severity ?: "normal"
+        addRiskBanner(
+            riskLevel = riskLevel,
+            headline = headline,
+            detail = "Japisagiya Gaon",
+        )
+
+        addLabel("What you need to do")
+        addCard(
+            "1. Move to higher ground now.\n" +
+            "2. Take your family and go with neighbours.\n" +
+            "3. Keep this phone charged and nearby."
+        )
+
+        alert?.let {
+            addPrimaryAction("I received this warning") {
+                emergencyStore.acknowledge(it.id, session.username)
+                updateStatus("Thank you. Your village authority has been notified.")
+            }
+        }
+        addSecondaryAction("Report an emergency") { showReportDialog(session) }
     }
 
     private fun renderSystemAdmin(session: SessionStore.Session) {
         val data = dashboardSummary
-        addSection("SYSTEM HEALTH", "Database  ${if (data == null) "Not connected" else "Supabase data loaded"}\nNearby relay  Available\nOffline queue  ${emergencyStore.reports().size} report(s)\nAudit events  ${emergencyStore.auditEntries()}")
-        addSection("SUPABASE DATA", "Stations  ${data?.stations?.size ?: 0}\nActive alerts  ${data?.alerts?.size ?: 0}\nRule evaluations  ${data?.evaluations?.size ?: 0}")
-        addSection("DEVICE MANAGEMENT", "This device: ${deviceName()}\nRelay registration: local\nLast sync: offline mode")
-        addSection("AUDIT LOG", "Emergency actions are recorded locally and can be synchronized when the backend is available.")
+        addRiskBanner(
+            riskLevel = if (data == null) "warning" else "normal",
+            headline = if (data == null) "Not connected" else "Systems healthy",
+            detail = this.deviceName(),
+        )
+        addLabel("Platform")
+        addMetric("Stations", "${data?.stations?.size ?: 0}")
+        addMetric("Active alerts", "${data?.alerts?.size ?: 0}")
+        addMetric("Rule evaluations", "${data?.evaluations?.size ?: 0}")
+
+        addLabel("Device and relay")
+        addMetric("Nearby relay", if (relayStarted) "Active" else "Stopped")
+        addMetric("Connected nodes", "${connectedEndpoints.size}")
+        addMetric("Offline queue", "${emergencyStore.reports().size} report(s)")
+        addMetric("Audit events", "${emergencyStore.auditEntries()}")
     }
 
-    private fun addSection(title: String, body: String) {
-        val titleView = TextView(this).apply { text = title; setTextColor(Color.rgb(121, 145, 142)); textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE }
-        val bodyView = TextView(this).apply { text = body; setTextColor(Color.rgb(232, 240, 236)); textSize = 15f; setPadding(0, 6, 0, 14) }
-        roleContent.addView(titleView); roleContent.addView(bodyView)
+    // ---------------------------------------------------------------------
+    // Light-theme UI helpers.
+    //
+    // A community member must never see a score; an operator must never read a
+    // paragraph to find the risk band. So risk is a colour + one word, and every
+    // fact sits in a card instead of a wall of monospace text.
+    // ---------------------------------------------------------------------
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun riskTone(riskLevel: String?): Pair<Int, Int> {
+        val normalized = (riskLevel ?: "normal").lowercase()
+        return when {
+            normalized.contains("critical") -> R.color.sx_critical to R.color.sx_critical_soft
+            normalized.contains("high") -> R.color.sx_high to R.color.sx_high_soft
+            normalized.contains("warning") || normalized.contains("moderate") -> R.color.sx_warning to R.color.sx_warning_soft
+            normalized.contains("watch") || normalized.contains("low") -> R.color.sx_watch to R.color.sx_watch_soft
+            else -> R.color.sx_normal to R.color.sx_normal_soft
+        }
     }
 
-    private fun addAction(label: String, action: () -> Unit) {
-        roleContent.addView(Button(this).apply { text = label; isAllCaps = false; setOnClickListener { action() } })
+    private fun severityTone(severity: String?): Pair<Int, Int> {
+        val normalized = (severity ?: "").lowercase()
+        return when {
+            normalized.contains("p0") || normalized.contains("critical") -> R.color.sx_critical to R.color.sx_critical_soft
+            normalized.contains("p1") || normalized.contains("high") -> R.color.sx_high to R.color.sx_high_soft
+            normalized.contains("p2") -> R.color.sx_warning to R.color.sx_warning_soft
+            else -> R.color.sx_normal to R.color.sx_normal_soft
+        }
     }
+
+    /** Section label: small, uppercase, muted. Sits above a card. */
+    private fun addLabel(title: String) {
+        roleContent.addView(TextView(this).apply {
+            text = title.uppercase()
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_text_faint))
+            textSize = 11f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            letterSpacing = 0.1f
+            setPadding(dp(2), dp(14), dp(2), dp(6))
+        })
+    }
+
+    /** A white bordered card holding one body of text. */
+    private fun addCard(body: String) {
+        roleContent.addView(TextView(this).apply {
+            text = body
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_text))
+            textSize = 15f
+            setLineSpacing(0f, 1.2f)
+            setBackgroundResource(R.drawable.sx_card)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+        })
+    }
+
+    /** A colour-coded card for the single most important fact on a screen. */
+    private fun addRiskBanner(riskLevel: String, headline: String, detail: String) {
+        val (accent, _) = riskTone(riskLevel)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(this@MainActivity).apply {
+                text = headline
+                setTextColor(ContextCompat.getColor(this@MainActivity, accent))
+                textSize = 20f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = detail
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_text_muted))
+                textSize = 13f
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+        roleContent.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundResource(R.drawable.sx_card)
+            addView(View(this@MainActivity).apply {
+                setBackgroundColor(ContextCompat.getColor(this@MainActivity, accent))
+            }, LinearLayout.LayoutParams(dp(6), LinearLayout.LayoutParams.MATCH_PARENT).apply {
+                setMargins(dp(16), dp(14), dp(12), dp(14))
+            })
+            addView(body, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, dp(14), dp(16), dp(14))
+            })
+        })
+    }
+
+    /** Compact label/value row so a number never needs a sentence around it. */
+    private fun addMetric(label: String, value: String) {
+        roleContent.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundResource(R.drawable.sx_card)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_text_muted))
+
+                textSize = 14f
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(TextView(this@MainActivity).apply {
+                text = value
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_text))
+                textSize = 14f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+        })
+    }
+
+    /** One-line village summary: name on the left, band + ETA on the right. */
+    private fun addVillageRow(name: String, band: String, eta: String, riskLevel: String) {
+        val (accent, _) = riskTone(riskLevel)
+        roleContent.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setBackgroundResource(R.drawable.sx_card)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            addView(View(this@MainActivity).apply {
+                setBackgroundColor(ContextCompat.getColor(this@MainActivity, accent))
+            }, LinearLayout.LayoutParams(dp(4), dp(28)).apply { setMargins(0, 0, dp(12), 0) })
+            addView(TextView(this@MainActivity).apply {
+                text = name
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_text))
+                textSize = 15f
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(TextView(this@MainActivity).apply {
+                text = "$band  ·  $eta"
+                setTextColor(ContextCompat.getColor(this@MainActivity, accent))
+                textSize = 13f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+        })
+    }
+
+    private fun addPrimaryAction(label: String, action: () -> Unit) {
+        roleContent.addView(Button(this).apply {
+            text = label
+            isAllCaps = false
+            setBackgroundResource(R.drawable.sx_button_primary)
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_surface))
+            setOnClickListener { action() }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        })
+    }
+
+    private fun addSecondaryAction(label: String, action: () -> Unit) {
+        roleContent.addView(Button(this).apply {
+            text = label
+            isAllCaps = false
+            setBackgroundResource(R.drawable.sx_button_secondary)
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.sx_brand))
+            setOnClickListener { action() }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        })
+    }
+
+    /** Human-readable band label. Residents never see a raw score. */
+    private fun bandLabel(riskLevel: String?): String = (riskLevel ?: "UNKNOWN").uppercase()
 
     private fun showReportDialog(session: SessionStore.Session) {
         val input = EditText(this).apply { hint = "Describe what is happening"; minLines = 3 }
@@ -412,10 +799,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // POST_NOTIFICATIONS must be requested explicitly on Android 13+.
+    // showAlertNotification() returns early without it, so a received alert
+    // would be accepted and forwarded but never actually appear on the phone.
+    // The previous variant of this app omitted it here, which is why relayed
+    // alerts could arrive silently.
     private fun requiredPermissions(): Array<String> = if (Build.VERSION.SDK_INT >= 33) {
-        arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.NEARBY_WIFI_DEVICES)
+        arrayOf(
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.NEARBY_WIFI_DEVICES,
+            Manifest.permission.POST_NOTIFICATIONS
+        )
     } else if (Build.VERSION.SDK_INT >= 31) {
-        arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
+        arrayOf(
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.POST_NOTIFICATIONS
+        )
     } else {
         arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
