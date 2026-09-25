@@ -14,7 +14,10 @@ class EmergencyStore(context: Context) : SQLiteOpenHelper(context, "lastmile_eme
         db.execSQL("CREATE TABLE reports (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, description TEXT NOT NULL, village TEXT NOT NULL, reported_by TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)")
         db.execSQL("CREATE TABLE acknowledgements (alert_id TEXT NOT NULL, username TEXT NOT NULL, acknowledged_at INTEGER NOT NULL, PRIMARY KEY(alert_id, username))")
         db.execSQL("CREATE TABLE audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, action TEXT NOT NULL, entity_id TEXT NOT NULL, created_at INTEGER NOT NULL)")
-        addAlert(db, "demo-p1", "P1", "Desang flood warning", "Japisagiya Gaon", "Move residents toward the designated safe area immediately.", "PENDING")
+        // No sample alert is seeded any more. A fabricated "Desang flood warning"
+        // made the alert queue look populated before any real data existed, which
+        // is misleading during a demo. Rows appear only when a real relayed or
+        // backend alert is received.
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit

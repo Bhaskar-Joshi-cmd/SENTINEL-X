@@ -361,11 +361,26 @@ class MainActivity : AppCompatActivity() {
         }
 
         addLabel("Villages at risk")
-        // Sample values stand in for the impact engine until the trigger
-        // backend is wired; the shape matches impact_assessments.
-        addVillageRow("Japisagiya Gaon", "CRITICAL", "15 min", "critical")
-        addVillageRow("Desang Deroi Habi", "CRITICAL", "30 min", "critical")
-        addVillageRow("Rajan Bagan", "HIGH", "45 min", "high")
+        // Real impact rows for the displayed station's basin, from the same
+        // backend impact engine the control room uses. The previous sample rows
+        // (Japisagiya Gaon / Desang Deroi Habi / Rajan Bagan with invented risk
+        // and ETA) were removed so the phone can never contradict the dashboard.
+        val impacts = data?.impacts.orEmpty()
+        if (impacts.isEmpty()) {
+            addCard(
+                if (data == null) "No data loaded." else
+                    "No impact assessment for this basin yet. The engine creates one when a score reaches 50."
+            )
+        } else {
+            impacts.forEach { impact ->
+                addVillageRow(
+                    impact.villageName,
+                    impact.riskLevel.uppercase(),
+                    "${impact.etaMinutes.toInt()} min",
+                    impact.riskLevel.lowercase()
+                )
+            }
+        }
 
         addLabel("Relay")
         addMetric("Nearby nodes", "${connectedEndpoints.size}")

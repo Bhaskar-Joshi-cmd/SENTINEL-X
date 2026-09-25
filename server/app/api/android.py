@@ -43,7 +43,10 @@ async def overview(river_code: str | None = None):
         .select(
             "id,station_code,station_name,river_name,district,state,"
             "latitude,longitude,warning_level_m,danger_level_m,"
-            "highest_flood_level_m"
+            # basin_id is required to scope the impact rows to this station's
+            # basin. It is read here only; station_payload below does not
+            # expose it in the response.
+            "highest_flood_level_m,basin_id"
         )
         .in_("station_code", station_codes)
         .execute()
@@ -148,6 +151,62 @@ async def overview(river_code: str | None = None):
             or []
         )
 
+    # Village impact for the station this payload actually displays.
+    #
+    # Scoped by basin, not by "whatever alert is newest". An alert belonging to
+    # another river would otherwise put the wrong basin's villages next to this
+    # station's water level and score. The names come from a join because
+    # impact_assessments stores only village_id.
+    impact_assessments: list[dict] = []
+    displayed_station = stations[0] if stations else None
+    if displayed_station is not None and displayed_station.get("basin_id"):
+        event_rows = (
+            admin.table("events")
+            .select("id")
+            .eq("basin_id", displayed_station["basin_id"])
+            .in_("status", ["monitoring", "active", "confirmed"])
+            .order("last_observed_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if event_rows:
+            impact_assessments = (
+                admin.table("impact_assessments")
+                .select(
+                    "village_id,risk_level,risk_score,"
+                    "time_to_impact_minutes,downstream_order,population_at_risk"
+                )
+                .eq("event_id", str(event_rows[0]["id"]))
+                .order("downstream_order")
+                .execute()
+                .data
+                or []
+            )
+
+            # impact_assessments stores only village_id, so names are resolved
+            # with one extra lookup rather than a fragile embedded join.
+            village_ids = [row.get("village_id") for row in impact_assessments]
+            village_ids = [vid for vid in village_ids if vid]
+            if village_ids:
+                village_rows = (
+                    admin.table("villages")
+                    .select("id,village_name")
+                    .in_("id", village_ids)
+                    .execute()
+                    .data
+                    or []
+                )
+                names_by_id = {
+                    str(v.get("id")): v.get("village_name")
+                    for v in village_rows
+                }
+                for row in impact_assessments:
+                    row["village_name"] = names_by_id.get(
+                        str(row.get("village_id"))
+                    )
+
     return {
         "source": "sentinel-x-fastapi",
         "river_code": normalized,
@@ -158,4 +217,5 @@ async def overview(river_code: str | None = None):
             if latest_evaluations
             else None
         ),
+        "impact_assessments": impact_assessments,
     }

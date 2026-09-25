@@ -33,7 +33,25 @@ class DashboardClient {
     data class Summary(
         val stations: List<Station>,
         val alerts: List<Alert>,
-        val evaluations: List<Evaluation>
+        val evaluations: List<Evaluation>,
+        // Real village impact for the basin of the station above. Empty when the
+        // basin has no active event yet, which is an honest state, not an error.
+        val impacts: List<Impact> = emptyList()
+    )
+
+    /**
+     * One village row from the backend impact engine. These replace the sample
+     * values the app previously rendered, so the phone shows the same
+     * risk/ETA figures as the control room.
+     */
+    data class Impact(
+        val villageId: String,
+        val villageName: String,
+        val riskLevel: String,
+        val riskScore: Double,
+        val etaMinutes: Double,
+        val downstreamOrder: Int,
+        val populationAtRisk: Int
     )
 
     /**
@@ -132,10 +150,41 @@ class DashboardClient {
                     }
                 }
 
+                val impactsJson = response.optJSONArray("impact_assessments")
+                    ?: org.json.JSONArray()
+
+                val impacts = buildList {
+                    for (index in 0 until impactsJson.length()) {
+                        val item = impactsJson.optJSONObject(index) ?: continue
+
+                        add(
+                            Impact(
+                                villageId = item.optString("village_id", ""),
+                                villageName = item.optString(
+                                    "village_name",
+                                    "Unnamed village"
+                                ),
+                                riskLevel = item.optString(
+                                    "risk_level",
+                                    "unknown"
+                                ),
+                                riskScore = item.optDouble("risk_score", 0.0),
+                                etaMinutes = item.optDouble(
+                                    "time_to_impact_minutes",
+                                    0.0
+                                ),
+                                downstreamOrder = item.optInt("downstream_order", 0),
+                                populationAtRisk = item.optInt("population_at_risk", 0)
+                            )
+                        )
+                    }
+                }
+
                 Summary(
                     stations = stations,
                     alerts = alerts,
-                    evaluations = evaluations
+                    evaluations = evaluations,
+                    impacts = impacts.sortedBy { it.downstreamOrder }
                 )
             }
 
