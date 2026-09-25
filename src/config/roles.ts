@@ -41,9 +41,18 @@ export const ROLE_DEFINITIONS: Record<RoleKey, RoleDefinition> = {
     key: 'village_authority',
     label: 'Village Authority',
     title: 'Local village operations',
-    description: 'Track the assigned village warning, local conditions and communication state.',
+    description: 'Designated village / Gram Panchayat / VDMC representative. Corroborate the local situation, review field confirmations and coordinate the local response.',
     navigation: [
       { id: 'overview', label: 'Village Dashboard', description: 'Assigned village warning and local conditions.' },
+    ],
+  },
+  community_manager: {
+    key: 'community_manager',
+    label: 'Community Manager',
+    title: 'Field verification',
+    description: 'Designated trained local field POC / volunteer (Aapda-Mitra type). The eyes on the ground: confirm or dispute village reports from the field.',
+    navigation: [
+      { id: 'overview', label: 'Field Desk', description: 'Village reports awaiting field confirmation or dispute.' },
     ],
   },
   community_member: {
@@ -70,6 +79,7 @@ export function isRoleKey(value: string | null | undefined): value is RoleKey {
   return value === 'control_room'
     || value === 'disaster_authority'
     || value === 'village_authority'
+    || value === 'community_manager'
     || value === 'community_member'
     || value === 'admin'
 }

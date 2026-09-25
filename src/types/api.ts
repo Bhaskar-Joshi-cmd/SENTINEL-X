@@ -4,6 +4,7 @@ export type RoleKey =
   | 'control_room'
   | 'disaster_authority'
   | 'village_authority'
+  | 'community_manager'
   | 'community_member'
   | 'admin'
 

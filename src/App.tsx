@@ -1,16 +1,20 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  Activity,
   AlertTriangle,
   ArrowRight,
   BatteryMedium,
   CheckCircle2,
   ChevronDown,
   CircleDot,
+  Clock3,
   CloudRain,
   Crosshair,
+  Database,
   Gauge,
   Info,
   LocateFixed,
+  MapPin,
   Menu,
   Radio,
   RefreshCw,
@@ -20,7 +24,9 @@ import {
   Signal,
   Siren,
   Smartphone,
+  TimerReset,
   TowerControl,
+  Waves,
   Wifi,
   WifiOff,
   X,
@@ -29,14 +35,21 @@ import {
   getAlert,
   getAlertImpact,
   getDashboardSummary,
+  getHydroReadings,
   getVillages,
+  replayTick,
+  sendRelayAlert,
   type Alert,
   type DashboardSummary,
   type ImpactAssessment,
+  type ReplayTickStation,
   type Village,
 } from './api'
 import { RoleWorkspace, type RoleKey } from './roleWorkspaces'
 import ConnectivityPage from './ConnectivityPage'
+import { InboundDataPage } from './InboundDataPage'
+import { VillageDeliveryPage } from './VillageDeliveryPage'
+import './command-view.css'
 
 type RiverCode = 'TEESTA' | 'DESANG'
 type NetworkKey = 'internet' | 'cellular' | 'mesh'
@@ -75,14 +88,18 @@ function riskLabel(riskLevel: string | null | undefined) {
   if (normalized === 'high') return 'HIGH'
   if (normalized === 'warning') return 'WARNING'
   if (normalized === 'watch') return 'WATCH'
+  // Live preview vocabulary from the impact engine — map to the closest
+  // displayed band so a real numeric score never renders beside 'NORMAL'.
+  if (normalized === 'moderate') return 'WARNING'
+  if (normalized === 'low') return 'WATCH'
   return 'NORMAL'
 }
 
 function riskColor(riskLevel: string | null | undefined) {
   const normalized = (riskLevel ?? 'watch').toLowerCase()
   if (normalized === 'critical' || normalized === 'high') return '#ff6b4a'
-  if (normalized === 'warning') return '#f3c969'
-  if (normalized === 'watch') return '#74c69d'
+  if (normalized === 'warning' || normalized === 'moderate') return '#f3c969'
+  if (normalized === 'watch' || normalized === 'low') return '#74c69d'
   return '#72d9c6'
 }
 
@@ -95,6 +112,19 @@ function formatTime(value: string | null | undefined) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '—'
   return date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+function dateTime(value: string | null | undefined) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
 }
 
 function formatEta(value: number | null | undefined) {
@@ -169,6 +199,22 @@ function mergeImpact(zones: Zone[], impacts: ImpactAssessment[]) {
       color: riskColor(impact.risk_level),
     }
   })
+}
+
+function buildZonePolyline(zones: Zone[]) {
+  if (zones.length < 1) return ''
+  const first = zones[0]
+  return [`16,23`, `${first.x},${first.y}`, ...zones.slice(1).map((zone) => `${zone.x},${zone.y}`)].join(' ')
+}
+
+function ThresholdCard({ label, value, tone }: { label: string; value: string; tone: string }) {
+  return <div className={`command-v4-threshold ${tone}`}><span>{label}</span><b>{value}</b></div>
+}
+
+function Factor({ label, value, max }: { label: string; value?: number | null; max: number }) {
+  const actual = typeof value === 'number' ? value : 0
+  const width = Math.max(0, Math.min(100, (actual / max) * 100))
+  return <div className="command-v4-factor"><div><span>{label}</span><b>{typeof value === 'number' ? `${value.toFixed(1)}/${max}` : '—'}</b></div><div className="command-v4-factor-track"><span style={{ width: `${width}%` }} /></div></div>
 }
 
 function ControlRoomPanel({
@@ -246,44 +292,41 @@ function App() {
   const [alertDetail, setAlertDetail] = useState<Alert | null>(null)
   const [alertTargets, setAlertTargets] = useState<unknown[]>([])
   const [alertDeliveries, setAlertDeliveries] = useState<unknown[]>([])
+  const [commandHistory, setCommandHistory] = useState<import('./api').HydroReading[]>([])
+  const [commandHistoryLoading, setCommandHistoryLoading] = useState(false)
+  const [commandHistoryError, setCommandHistoryError] = useState('')
+  // Per-station auto-stream snapshots (keyed by station_code). The 10s tick
+  // advances EVERY station on the backend; each river page renders from its
+  // own snapshot, so both basins stay live no matter which one is on screen.
+  const [streamSnapshot, setStreamSnapshot] = useState<Record<string, ReplayTickStation>>({})
+  const [dataRefreshToken, setDataRefreshToken] = useState(0)
+  const [dashboardVersion, setDashboardVersion] = useState(0)
+  // Manual relay trigger: opens a village picker, then calls the relay-alert
+  // endpoint. That endpoint lands in the next phase, so the panel reports the
+  // pending state honestly instead of pretending a message was relayed.
+  const [relayPickerOpen, setRelayPickerOpen] = useState(false)
+  const [relayTriggerState, setRelayTriggerState] = useState<{ tone: 'pending' | 'sent' | 'error'; text: string } | null>(null)
+  const [relaySending, setRelaySending] = useState(false)
+  const dashboardRefreshInFlight = useRef(false)
+  // Basin reference data is stable; caching it lets the station card and map
+  // switch immediately without waiting for a second round trip.
+  const villageCacheRef = useRef<Record<RiverCode, Village[]>>({} as Record<RiverCode, Village[]>)
 
+  // Full-screen loading is reserved for the first application load. Basin
+  // switches reuse the already-loaded dashboard station data and swap the
+  // village list in the background, so the control room never blanks out.
   useEffect(() => {
     let cancelled = false
 
     async function loadDashboard() {
-      setLoading(true)
       setError('')
-      setImpactAssessments([])
-      setImpactError('')
-      setSelectedVillageId(null)
-
       try {
-        const [summary, villageResponse] = await Promise.all([
-          getDashboardSummary(),
-          getVillages(riverCode),
-        ])
-
+        const summary = await getDashboardSummary()
         if (cancelled) return
-
         setDashboard(summary)
-        setVillages(villageResponse.items)
-
-        const stationForRiver = summary.stations.find((entry) => {
-          const code = entry.station.station_code.toUpperCase()
-          return riverCode === 'TEESTA' ? code === 'CWC_MELLI' : code === 'CWC_NANGLAMORAGHAT'
-        })
-        const latestReadingId = stationForRiver?.latest_reading?.id
-        const evaluation = latestReadingId
-          ? summary.recent_evaluations.find((item) => item.hydro_reading_id === latestReadingId)
-          : undefined
-
-        setZones(projectVillages(villageResponse.items, [], evaluation?.risk_level ?? 'watch'))
-        setStarted(false)
-        setNetworks({ internet: true, cellular: true, mesh: false })
-        setTick(0)
+        setDashboardVersion((value) => value + 1)
       } catch (loadError) {
-        if (cancelled) return
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load dashboard data')
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : 'Failed to load dashboard data')
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -291,7 +334,79 @@ function App() {
 
     void loadDashboard()
     return () => { cancelled = true }
+  }, [])
+
+  // Villages are small, stable reference data. Cache each basin and render
+  // its cached list immediately on switch; refresh the selected basin quietly
+  // in the background without setting the global loading flag.
+  useEffect(() => {
+    let cancelled = false
+    let inFlight = false
+
+    async function loadVillages() {
+      if (inFlight) return
+      const cached = villageCacheRef.current[riverCode]
+      if (cached) {
+        setVillages(cached)
+        setSelectedVillageId(null)
+      } else {
+        setVillages([])
+      }
+      inFlight = true
+      try {
+        const response = await getVillages(riverCode)
+        if (cancelled) return
+        const items = response.items ?? []
+        villageCacheRef.current[riverCode] = items
+        setVillages(items)
+        setSelectedVillageId(null)
+      } catch (loadError) {
+        if (!cancelled) {
+          const cached = villageCacheRef.current[riverCode]
+          if (cached) {
+            setVillages(cached)
+            setError('')
+          } else {
+            setError(loadError instanceof Error ? loadError.message : 'Unable to load villages for this basin')
+          }
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    void loadVillages()
+    return () => { cancelled = true }
   }, [riverCode])
+
+  // Global dashboard refresh: the current station/evaluation/alerts update
+  // every five seconds even while the user changes basins.
+  useEffect(() => {
+    let cancelled = false
+
+    async function refreshDashboard() {
+      if (dashboardRefreshInFlight.current || document.visibilityState !== 'visible') return
+      dashboardRefreshInFlight.current = true
+      try {
+        const summary = await getDashboardSummary()
+        if (cancelled) return
+        setDashboard(summary)
+        setDashboardVersion((value) => value + 1)
+      } catch (loadError) {
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : 'Failed to refresh dashboard data')
+      } finally {
+        dashboardRefreshInFlight.current = false
+      }
+    }
+
+    const refreshTimer = window.setInterval(() => {
+      if (!cancelled) void refreshDashboard()
+    }, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(refreshTimer)
+    }
+  }, [])
 
   const stationSnapshot = useMemo(() => {
     if (!dashboard) return null
@@ -304,7 +419,12 @@ function App() {
   const latestEvaluation = useMemo(() => {
     const readingId = stationSnapshot?.latest_reading?.id
     if (!readingId || !dashboard) return null
-    return dashboard.recent_evaluations.find((item) => item.hydro_reading_id === readingId) ?? null
+    return dashboard.recent_evaluations
+      .filter((item) => item.hydro_reading_id === readingId)
+      .sort((a, b) => {
+        const timeDifference = new Date(b.evaluated_at).getTime() - new Date(a.evaluated_at).getTime()
+        return timeDifference || b.total_score - a.total_score
+      })[0] ?? null
   }, [dashboard, stationSnapshot])
 
   const activeAlert = useMemo<Alert | null>(() => {
@@ -330,7 +450,8 @@ function App() {
 
     const alertId = activeAlert.id
     let cancelled = false
-    setImpactLoading(true)
+    const hasExistingImpact = impactAssessments.length > 0
+    setImpactLoading(!hasExistingImpact)
     setImpactError('')
 
     async function loadImpact() {
@@ -340,7 +461,7 @@ function App() {
         setImpactAssessments(response.items ?? [])
       } catch (impactLoadError) {
         if (cancelled) return
-        setImpactAssessments([])
+        if (!hasExistingImpact) setImpactAssessments([])
         setImpactError(impactLoadError instanceof Error ? impactLoadError.message : 'Unable to load impact assessment')
       } finally {
         if (!cancelled) setImpactLoading(false)
@@ -382,6 +503,29 @@ function App() {
     ? [...impactAssessments].sort((a, b) => a.time_to_impact_minutes - b.time_to_impact_minutes)[0]
     : null
 
+  // Streamed outputs: the active river's tick snapshot carries a fresh
+  // rule-engine evaluation plus a dynamic impact preview, so scores/ETA
+  // update every 10s tick for whichever river is on screen (and the other
+  // river keeps streaming in the background).
+  const streamEntry = streamSnapshot[station?.station_code ?? ''] ?? null
+  const displayEvaluation = streamEntry?.evaluation ?? latestEvaluation
+  const displayImpactAssessments = streamEntry?.impact_assessments?.length
+    ? streamEntry.impact_assessments
+    : impactAssessments
+  const displayZones = useMemo(
+    () => (streamEntry?.impact_assessments?.length ? mergeImpact(zones, streamEntry.impact_assessments) : zones),
+    [streamEntry, zones],
+  )
+  const displayNearestImpact = useMemo(
+    () => (displayImpactAssessments.length
+      ? [...displayImpactAssessments].sort((a, b) => a.time_to_impact_minutes - b.time_to_impact_minutes)[0]
+      : null),
+    [displayImpactAssessments],
+  )
+  const displayPopulationAtRisk = displayImpactAssessments.length
+    ? displayImpactAssessments.reduce((sum, item) => sum + (item.population_at_risk ?? 0), 0)
+    : totalPopulationAtRisk
+
   const totalCoverage = zones.length
     ? Math.round(zones.reduce((sum, zone) => sum + zone.coverage, 0) / zones.length)
     : 0
@@ -396,8 +540,8 @@ function App() {
 
   const selectedVillage = useMemo(() => {
     if (!selectedVillageId) return null
-    return zones.find((zone) => zone.id === selectedVillageId) ?? null
-  }, [selectedVillageId, zones])
+    return displayZones.find((zone) => zone.id === selectedVillageId) ?? null
+  }, [selectedVillageId, displayZones])
 
   const routeText = networks.internet
     ? 'Cloud → tower → village'
@@ -410,6 +554,126 @@ function App() {
   const routePath = useMemo(() => buildRoutePath(zones), [zones])
   const dataMode = String(reading?.data_mode ?? 'historical').toLowerCase()
   const dataModeLabel = dataMode === 'replay' ? 'HISTORICAL DATA REPLAY' : dataMode === 'live' ? 'LIVE DATA' : 'HISTORICAL DATA'
+
+  useEffect(() => {
+    setCommandHistoryError('')
+
+    if (!station?.station_code) {
+      setCommandHistory([])
+      return
+    }
+
+    let cancelled = false
+    setCommandHistoryLoading(true)
+
+    void getHydroReadings(station.station_code, 50)
+      .then((response) => {
+        if (!cancelled) setCommandHistory(response.items ?? [])
+      })
+      .catch((loadError) => {
+        if (!cancelled) {
+          setCommandHistory([])
+          setCommandHistoryError(
+            loadError instanceof Error
+              ? loadError.message
+              : 'Unable to load historical station data',
+          )
+        }
+      })
+      .finally(() => {
+                if (!cancelled) setCommandHistoryLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [station?.station_code])
+
+  const commandChronologicalHistory = useMemo(
+    () => [...commandHistory].sort(
+      (a, b) => new Date(a.observed_at).getTime() - new Date(b.observed_at).getTime(),
+    ),
+    [commandHistory],
+  )
+
+  // Always-on backend stream: every 10s one tick advances EVERY station
+  // (both basins) to its next chronological historical reading and evaluates
+  // it through the same rule engine as live ingestion. The cursor lives in
+  // the DB (each station's latest rule evaluation), so no local locks are
+  // needed, row counts never have to match between stations, and the stream
+  // wraps back to the top of the dataset on its own after the newest row.
+  useEffect(() => {
+    let cancelled = false
+    let inFlight = false
+
+    async function runStreamTick() {
+      if (cancelled || inFlight || document.visibilityState !== 'visible') return
+      inFlight = true
+      try {
+        const response = await replayTick()
+        if (cancelled) return
+        setStreamSnapshot((current) => {
+          const next = { ...current }
+          for (const entry of response.stations ?? []) {
+            if (entry.error) continue
+            next[entry.station_code] = entry
+          }
+          return next
+        })
+      } catch (streamError) {
+        if (!cancelled) {
+          setCommandHistoryError(streamError instanceof Error ? streamError.message : 'Auto stream tick failed')
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    // Start after the first interval rather than immediately, so the first
+    // paint and basin interaction are not competing with a full two-station
+    // evaluation pass.
+    const timer = window.setInterval(() => { void runStreamTick() }, 10000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  const commandDisplayReading = streamEntry?.reading ?? reading
+
+  const commandReplayBand = useMemo(() => {
+    const level = typeof commandDisplayReading?.water_level_m === 'number'
+      ? commandDisplayReading.water_level_m
+      : null
+    const warning = typeof station?.warning_level_m === 'number'
+      ? station.warning_level_m
+      : null
+    const danger = typeof station?.danger_level_m === 'number'
+      ? station.danger_level_m
+      : null
+    const hfl = typeof station?.highest_flood_level_m === 'number'
+      ? station.highest_flood_level_m
+      : null
+
+    if (level == null || warning == null) return 'MONITORING'
+    if (level < warning) return 'NORMAL'
+    if (danger != null && level < danger) return 'WATCH'
+    if (hfl != null && level < hfl) return 'WARNING'
+    return 'CRITICAL'
+  }, [commandDisplayReading?.water_level_m, station?.warning_level_m, station?.danger_level_m, station?.highest_flood_level_m])
+
+  const commandDisplayedMode = streamEntry
+    ? 'AUTO STREAM · HISTORICAL DATASET'
+    : dataModeLabel
+
+  const commandDisplayedRisk = streamEntry?.risk_level
+    ? riskLabel(streamEntry.risk_level)
+    : riskLabel(latestEvaluation?.risk_level)
+
+  const commandDisplayedThresholdGap = typeof commandDisplayReading?.water_level_m === 'number' && typeof station?.danger_level_m === 'number'
+    ? station.danger_level_m - commandDisplayReading.water_level_m
+    : null
 
   function resetScenario() {
     setStarted(false)
@@ -461,6 +725,40 @@ function App() {
     }
   }
 
+  function openRelayPicker() {
+    setRelayPickerOpen(true)
+    setRelayTriggerState(null)
+  }
+
+  function closeRelayPicker() {
+    if (relaySending) return
+    setRelayPickerOpen(false)
+  }
+
+  // Manual relay trigger. The relay/hop code on the Android app is untouched —
+  // this only calls the backend seam that will be implemented in the next phase.
+  // Until that endpoint exists the request fails and we report it honestly.
+  async function triggerRelay(villageId: string) {
+    if (relaySending) return
+    const village = zones.find((zone) => zone.id === villageId)
+    if (!village) return
+
+    setRelaySending(true)
+    setRelayTriggerState({ tone: 'pending', text: `Relaying ${village.name}…` })
+    try {
+      const result = await sendRelayAlert(village.id, village.riskScore ?? 0)
+      setRelayTriggerState({ tone: 'sent', text: `Relayed to ${village.name} · ${result.priority} · ${result.hops} hop(s)` })
+      setRelayPickerOpen(false)
+    } catch (triggerError) {
+      setRelayTriggerState({
+        tone: 'error',
+        text: triggerError instanceof Error ? triggerError.message : 'Relay trigger failed',
+      })
+    } finally {
+      setRelaySending(false)
+    }
+  }
+
   async function sendPhoneNotification() {
     if (!('Notification' in window)) {
       setNotificationState('blocked')
@@ -491,6 +789,7 @@ function App() {
     control_room: 'Control Room',
     disaster_authority: 'Disaster Authority',
     village_authority: 'Village Authority',
+    community_manager: 'Community Manager',
     community_member: 'Community Member',
     admin: 'System Admin',
   }
@@ -543,7 +842,7 @@ function App() {
           <label className="role-switcher">
             <span>DEMO ROLE</span>
             <select value={selectedRole} onChange={(event) => handleRoleChange(event.target.value as RoleKey)} aria-label="Select demo role">
-              {(['control_room', 'disaster_authority', 'village_authority', 'community_member'] as RoleKey[]).map((key) => <option key={key} value={key}>{roleLabel[key]}</option>)}
+              {(['control_room', 'disaster_authority', 'village_authority', 'community_manager', 'community_member'] as RoleKey[]).map((key) => <option key={key} value={key}>{roleLabel[key]}</option>)}
             </select>
           </label>
         </div>
@@ -563,7 +862,7 @@ function App() {
           )}
           <div className="mobile-role-list">
             <span>DEMO ROLE</span>
-            {(['control_room', 'disaster_authority', 'village_authority', 'community_member'] as RoleKey[]).map((key) => <button className={selectedRole === key ? 'selected' : ''} key={key} onClick={() => handleRoleChange(key)}>{roleLabel[key]}</button>)}
+            {(['control_room', 'disaster_authority', 'village_authority', 'community_manager', 'community_member'] as RoleKey[]).map((key) => <button className={selectedRole === key ? 'selected' : ''} key={key} onClick={() => handleRoleChange(key)}>{roleLabel[key]}</button>)}
           </div>
         </div>
       )}
@@ -588,167 +887,347 @@ function App() {
           />
         ) : (
         activeTab === 'Command view' ? <>
-        <section className="intro-row">
+        <section className="command-v4-head">
           <div>
-            <div className="eyebrow"><span className="eyebrow-line" /> {PRODUCT_NAME} / RESILIENCE COMMAND</div>
-            <h1>When the network dies,<br /><em>the warning doesn't.</em></h1>
-            <p className="intro-copy">A resilient emergency warning network for the last mile.<br />Detect risk, route urgency, and keep communities informed when infrastructure fails.</p>
+            <span className="command-v4-kicker">SENTINEL-X / CONTROL ROOM</span>
+            <h1>River hazard command</h1>
+            <p>One operational view of the station signal, rule-engine decision, downstream impact and human warning gate.</p>
           </div>
-          <div className="intro-actions">
-            <label className="scenario-label" htmlFor="river-select">ACTIVE BASIN</label>
-            <select id="river-select" className="scenario-select" value={riverCode} onChange={(event) => { setRiverCode(event.target.value as RiverCode); setTick(0); setStarted(false) }} aria-label="Select river scenario">
-              <option value="TEESTA">Teesta / CWC Melli</option>
-              <option value="DESANG">Desang / CWC Nanglamoraghat</option>
-            </select>
-            <button className="refresh" onClick={resetScenario} title="Reset delivery simulation"><RefreshCw size={17} /></button>
+          <div className="command-v4-actions">
+            <label>
+              <span>ACTIVE BASIN</span>
+              <select value={riverCode} onChange={(event) => setRiverCode(event.target.value as RiverCode)}>
+                <option value="TEESTA">Teesta / Melli</option>
+                <option value="DESANG">Desang / Nanglamoraghat</option>
+              </select>
+            </label>
+            <button className="command-v4-btn secondary" onClick={resetScenario} title="Reset local dashboard state">
+              <RefreshCw size={15} /> Reset
+            </button>
           </div>
         </section>
 
-        <section className="brand-context-bar">
-          <div><b>{PRODUCT_NAME}</b><span>{PRODUCT_DESCRIPTOR}</span></div>
-          <div className="context-tag">{TAGLINE}</div>
-          <div className="data-mode-tag"><span className="status-dot" /> {dataModeLabel}</div>
+        {error && <div className="command-v4-error"><AlertTriangle size={16} /> <span>Backend error: {error}</span></div>}
+
+        <section className="command-v4-context panel">
+          <div>
+            <span className="command-v4-kicker">{commandDisplayedMode}</span>
+            <b>{station?.station_name ?? 'Monitoring station'}</b>
+            <small>{station?.river_name ?? riverCode} · {station?.district ?? 'District unavailable'}</small>
+          </div>
+          <div className="command-v4-replay">
+            <div>
+              <TimerReset size={16} />
+              <span>{streamEntry ? `AUTO STREAM · step ${streamEntry.step_index} / ${streamEntry.total_steps} · every 10s` : 'AUTO STREAM · connecting…'}</span>
+            </div>
+          </div>
         </section>
 
-        <section className="stats-grid">
-          <Stat label="TIME TO IMPACT" value={nearestImpact ? formatEta(nearestImpact.time_to_impact_minutes) : '—'} suffix={nearestImpact ? zones.find((z) => z.id === nearestImpact.village_id)?.name ?? 'nearest downstream village' : 'impact assessment pending'} icon={<Gauge size={17} />} accent="coral" />
-          <Stat label="POPULATION AT RISK" value={formatNumber(totalPopulationAtRisk)} suffix={`${zones.length} mapped villages`} icon={<ShieldCheck size={17} />} accent="lime" />
-          <Stat label="VILLAGES MAPPED" value={String(zones.length).padStart(2, '0')} suffix="basin village layer" icon={<CircleDot size={17} />} accent="yellow" />
-          <Stat label="MESSAGE PRIORITY" value={priority} suffix={`${riskLabel(latestEvaluation?.risk_level)} / score ${latestEvaluation?.total_score ?? '—'}`} icon={<Siren size={17} />} accent="coral" />
+        <section className="command-v4-stations">
+          {(dashboard?.stations ?? []).map((entry) => {
+            const active = entry.station.station_code === station?.station_code
+            const shownReading = streamSnapshot[entry.station.station_code]?.reading ?? entry.latest_reading
+            const entryStream = streamSnapshot[entry.station.station_code] ?? null
+            const dotBand = active
+              ? commandReplayBand.toLowerCase()
+              : entryStream?.risk_level ? riskLabel(entryStream.risk_level).toLowerCase() : ''
+            return (
+              <button
+                key={entry.station.id}
+                className={`command-v4-station ${active ? 'active' : ''}`}
+                onClick={() => setRiverCode(entry.station.station_code === 'CWC_MELLI' ? 'TEESTA' : 'DESANG')}
+              >
+                <span className="command-v4-station-icon"><Waves size={16} /></span>
+                <span className="command-v4-station-copy">
+                  <small>{entry.station.river_name ?? 'River'}</small>
+                  <b>{entry.station.station_name}</b>
+                  <span>{shownReading?.water_level_m != null ? `${Number(shownReading.water_level_m).toFixed(2)} m` : 'No reading'} · {formatTime(shownReading?.observed_at)}</span>
+                </span>
+                <span className={`command-v4-state-dot ${dotBand}`} />
+              </button>
+            )
+          })}
         </section>
 
-        {error && <div className="panel error-banner"><AlertTriangle size={16} /> Backend error: {error}</div>}
+        <section className="command-v4-metrics">
+          <div className="command-v4-metric accent-coral">
+            <span>WATER LEVEL</span>
+            <strong>{commandDisplayReading?.water_level_m != null ? `${Number(commandDisplayReading.water_level_m).toFixed(2)} m` : '—'}</strong>
+            <small>{streamEntry ? 'auto-streamed observation' : 'latest station observation'}</small>
+          </div>
+          <div className="command-v4-metric accent-yellow">
+            <span>BACKEND RISK</span>
+            <strong>{displayEvaluation?.total_score != null ? `${displayEvaluation.total_score.toFixed(0)}/100` : '—'}</strong>
+            <small>{riskLabel(displayEvaluation?.risk_level)} · {displayEvaluation?.alert_recommended ? 'alert recommended' : 'monitoring'}</small>
+          </div>
+          <div className="command-v4-metric accent-lime">
+            <span>TIME TO IMPACT</span>
+            <strong>{displayNearestImpact ? formatEta(displayNearestImpact.time_to_impact_minutes) : '—'}</strong>
+            <small>{displayNearestImpact ? displayZones.find((z) => z.id === displayNearestImpact.village_id)?.name ?? 'nearest assessed village' : 'impact assessment pending'}</small>
+          </div>
+          <div className="command-v4-metric accent-cyan">
+            <span>POPULATION AT RISK</span>
+            <strong>{formatNumber(displayPopulationAtRisk)}</strong>
+            <small>{displayImpactAssessments.length} assessed villages</small>
+          </div>
+        </section>
 
-                <section className="workspace-grid">
-          <div className="map-panel panel">
-            <div className="panel-head">
-              <div><span className="section-kicker">01 / GEOGRAPHIC TWIN</span><h2>Hazard & impact map</h2></div>
-              <div className="map-legend"><span><i className="legend-dot danger" /> Impact path</span></div>
+        <section className="command-v4-grid">
+          <article className="command-v4-hazard panel">
+            <div className="command-v4-panel-head">
+              <div><span className="command-v4-kicker">01 / HAZARD STATE</span><h2>{station?.river_name ?? riverCode} / {station?.station_name ?? 'Station'}</h2></div>
+              <span className={`command-v4-risk ${commandDisplayedRisk.toLowerCase()}`}>
+                {commandDisplayedRisk}
+              </span>
             </div>
 
-            <div className="map-canvas">
-              <div className="map-grid-lines" />
-              <svg className="route-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-                <path d={routePath} className="route-path faint" />
-                <path d={routePath} className="route-path" />
-              </svg>
-              <div className="map-compass"><Crosshair size={15} /> N</div>
-              <div className="river river-one" /><div className="river river-two" />
+            <div className="command-v4-current-row">
+              <div className="command-v4-current">
+                <span>CURRENT WATER LEVEL</span>
+                <strong>{commandDisplayReading?.water_level_m != null ? `${Number(commandDisplayReading.water_level_m).toFixed(2)} m` : '—'}</strong>
+                <small>{formatTime(commandDisplayReading?.observed_at)} · {streamEntry ? `stream step ${streamEntry.step_index}/${streamEntry.total_steps}` : 'backend latest reading'}</small>
+              </div>
+              <div className="command-v4-impact-callout">
+                <Clock3 size={17} />
+                <div><span>NEAREST IMPACT</span><strong>{displayNearestImpact ? formatEta(displayNearestImpact.time_to_impact_minutes) : '—'}</strong><small>{displayNearestImpact ? displayZones.find((z) => z.id === displayNearestImpact.village_id)?.name ?? 'assessed village' : 'Assessment pending'}</small></div>
+              </div>
+            </div>
 
-              {zones.map((zone) => (
-                <button
-                  className={'zone-node ' + (zone.id === highestRiskGap?.id ? 'selected' : '') + (zone.id === selectedVillageId ? ' focused' : '')}
-                  style={{ left: zone.x + '%', top: zone.y + '%' }}
-                  key={zone.id}
-                  onClick={() => setSelectedVillageId(zone.id)}
-                  title={`${zone.name} — ${zone.risk}`}
-                >
-                  <div className="zone-ring" style={{ borderColor: zone.color }}><div className="zone-core" style={{ backgroundColor: zone.color }} /></div>
-                  <div className="zone-label"><b>{zone.name}</b><span>{zone.risk}{zone.riskScore != null ? ` · ${zone.riskScore}` : ''}</span></div>
+            <div className="command-v4-thresholds">
+              <ThresholdCard label="Current" value={commandDisplayReading?.water_level_m != null ? `${Number(commandDisplayReading.water_level_m).toFixed(2)} m` : '—'} tone="current" />
+              <ThresholdCard label="Warning" value={station?.warning_level_m != null ? `${Number(station.warning_level_m).toFixed(2)} m` : '—'} tone="warning" />
+              <ThresholdCard label="Danger" value={station?.danger_level_m != null ? `${Number(station.danger_level_m).toFixed(2)} m` : '—'} tone="danger" />
+              <ThresholdCard label="HFL" value={station?.highest_flood_level_m != null ? `${Number(station.highest_flood_level_m).toFixed(2)} m` : '—'} tone="hfl" />
+            </div>
+
+            <div className="command-v4-secondary-metrics">
+              <div><span>Rise rate</span><b>{commandDisplayReading?.water_level_rate_m_hr != null ? `${Number(commandDisplayReading.water_level_rate_m_hr).toFixed(2)} m/hr` : '—'}</b></div>
+              <div><span>Danger margin</span><b>{commandDisplayedThresholdGap != null ? `${Math.abs(commandDisplayedThresholdGap).toFixed(2)} m ${commandDisplayedThresholdGap >= 0 ? 'below' : 'above'}` : '—'}</b></div>
+              <div><span>Observed</span><b>{formatTime(commandDisplayReading?.observed_at)}</b></div>
+              <div><span>Freshness</span><b>{commandDisplayReading?.observed_at ? 'Timestamped' : 'Unavailable'}</b></div>
+            </div>
+          </article>
+
+          <article className="command-v4-alert panel">
+            <div className="command-v4-panel-head">
+              <div><span className="command-v4-kicker">02 / ALERT CONTROL</span><h2>Human approval gate</h2></div>
+              <span className={`command-v4-status ${activeAlert ? 'attention' : 'quiet'}`}>{alertStatus.toUpperCase()}</span>
+            </div>
+            <div className="command-v4-alert-summary">
+              <div className="command-v4-alert-icon"><AlertTriangle size={20} /></div>
+              <div><h3>{alertTitle}</h3><p>{activeAlert?.description ?? displayEvaluation?.reasons?.[0] ?? 'The rule engine is monitoring station thresholds and supporting evidence.'}</p></div>
+            </div>
+            <div className="command-v4-alert-facts">
+              <div><span>Priority</span><b>{priority}</b></div>
+              <div><span>Risk score</span><b>{displayEvaluation?.total_score != null ? `${displayEvaluation.total_score.toFixed(1)}/100` : '—'}</b></div>
+              <div><span>Generated</span><b>{formatTime(activeAlert?.created_at ?? displayEvaluation?.evaluated_at)}</b></div>
+            </div>
+            {activeAlert ? (
+              <button className="command-v4-review" onClick={openAlertReview}><ShieldCheck size={16} /> Review alert & impact <ArrowRight size={15} /></button>
+            ) : (
+              <div className="command-v4-note"><ShieldCheck size={15} /><span>{displayEvaluation?.alert_recommended ? 'Alert recommended. Authenticated Control Room approval is required before dispatch.' : 'Monitoring only. No public warning is currently recommended.'}</span></div>
+            )}
+            <div className="command-v4-warning-note"><ShieldCheck size={14} /><span>Only the authorized Control Room workflow can approve a public warning. Replay does not change alert state.</span></div>
+          </article>
+        </section>
+
+        <section className="command-v4-grid lower">
+          <article className="command-v4-map panel">
+            <div className="command-v4-panel-head">
+              <div><span className="command-v4-kicker">03 / IMPACT MAP</span><h2>Station → downstream villages</h2></div>
+              <span className="command-v4-map-help"><MapPin size={14} /> Click a village</span>
+            </div>
+            <div className="command-v4-map-canvas">
+              <div className="command-v4-map-grid" />
+              <div className="command-v4-map-water" />
+              <svg className="command-v4-map-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                {displayZones.length > 1 && <polyline points={buildZonePolyline(displayZones)} />}
+              </svg>
+              <div className="command-v4-map-station" style={{ left: '16%', top: '23%' }}>
+                <span className="pulse" />
+                <span className="core"><CloudRain size={14} /></span>
+                <b>{station?.station_name ?? 'Station'}</b>
+                <small>{commandDisplayReading?.water_level_m != null ? `${Number(commandDisplayReading.water_level_m).toFixed(2)} m` : '—'}</small>
+              </div>
+              {displayZones.map((zone) => (
+                <button key={zone.id} className={`command-v4-village-marker ${zone.id === selectedVillageId ? 'selected' : ''}`} style={{ left: `${zone.x}%`, top: `${zone.y}%` }} onClick={() => setSelectedVillageId(zone.id)} title={`${zone.name} · ${zone.risk}`}>
+                  <span className={`dot ${zone.risk.toLowerCase()}`} />
+                  <span><b>{zone.name}</b><small>{zone.riskScore != null ? `${zone.risk} · ${zone.riskScore}/100` : 'No current impact assessment'}</small></span>
                 </button>
               ))}
-
-              <div className="source-marker">
-                <div className="source-icon"><CloudRain size={16} /></div>
-                <span>{station?.station_name ?? 'hydro station'}</span>
-              </div>
-              <div className="map-scale">0 <span /> 10 km</div>
+              <div className="command-v4-map-legend"><span><i className="station" /> Station</span><span><i className="village" /> Village</span><span><i className="route" /> Impact path</span></div>
             </div>
+          </article>
 
-            <div className="map-footer">
-              <div className="map-status"><span className="status-dot" /> {impactAssessments.length ? `${impactAssessments.length} assessed villages` : 'Impact assessment pending'}</div>
-              <button className="outline-btn" onClick={locateRiskGap}><LocateFixed size={15} /> Locate risk gap</button>
+          <article className="command-v4-evidence panel">
+            <div className="command-v4-panel-head">
+              <div><span className="command-v4-kicker">04 / RULE ENGINE</span><h2>Current backend decision</h2></div>
+              <div className="command-v4-score">{displayEvaluation?.total_score != null ? displayEvaluation.total_score.toFixed(0) : '—'}<small>/100</small></div>
             </div>
-          </div>
-
-          <aside className="side-column">
-            <div className="panel hazard-card">
-              <div className="panel-head compact">
-                <div><span className="section-kicker">HAZARD STATE</span><h2>{station?.river_name ?? riverCode} / {station?.station_name ?? 'Station'}</h2></div>
-                <span className={'risk-summary ' + riskLabel(latestEvaluation?.risk_level).toLowerCase()}>{riskLabel(latestEvaluation?.risk_level)}</span>
-              </div>
-              <div className="threshold-grid">
-                <div><small>Current</small><b>{reading?.water_level_m != null ? `${Number(reading.water_level_m).toFixed(2)} m` : '—'}</b></div>
-                <div><small>Warning</small><b>{station?.warning_level_m != null ? `${Number(station.warning_level_m).toFixed(2)} m` : '—'}</b></div>
-                <div><small>Danger</small><b>{station?.danger_level_m != null ? `${Number(station.danger_level_m).toFixed(2)} m` : '—'}</b></div>
-                <div><small>HFL</small><b>{station?.highest_flood_level_m != null ? `${Number(station.highest_flood_level_m).toFixed(2)} m` : '—'}</b></div>
-              </div>
-              <div className="hazard-foot"><span>Rise rate <b>{reading?.water_level_rate_m_hr != null ? `${Number(reading.water_level_rate_m_hr).toFixed(2)} m/hr` : '—'}</b></span><span>Observed <b>{formatTime(reading?.observed_at)}</b></span></div>
+            <div className="command-v4-factors">
+              <Factor label="Water level" value={displayEvaluation?.level_score} max={60} />
+              <Factor label="Rise rate" value={displayEvaluation?.rate_score} max={20} />
+              <Factor label="Sensor" value={displayEvaluation?.sensor_score} max={10} />
+              <Factor label="Community" value={displayEvaluation?.community_score} max={5} />
+              <Factor label="Persistence" value={displayEvaluation?.persistence_score} max={5} />
             </div>
-
-            <div className="panel alert-card">
-              <div className="alert-top">
-                <span className="section-kicker">ALERT CONTROL / {priority}</span>
-                <span className="verified"><ShieldCheck size={14} /> {alertStatus.toUpperCase()}</span>
-              </div>
-              <div className="alert-title">
-                <div className="alert-symbol"><AlertTriangle size={21} /></div>
-                <div><h2>{alertTitle}</h2><p>{latestEvaluation?.reasons?.[0] ?? activeAlert?.description ?? 'Rule engine monitoring station thresholds'}</p></div>
-              </div>
-              <div className="alert-meta">
-                <span><b>{formatTime(activeAlert?.created_at ?? latestEvaluation?.evaluated_at)}</b> generated</span>
-                <span><b>{latestEvaluation?.total_score ?? '—'}</b> risk score</span>
-              </div>
-              {activeAlert ? (
-                <button className="primary-btn" onClick={openAlertReview}><ShieldCheck size={16} /> Review alert & impact <ArrowRight size={15} /></button>
-              ) : (
-                <div className="approval-note"><Info size={15} /><span>{latestEvaluation?.alert_recommended ? 'An alert is recommended. Human approval is required before public dispatch.' : 'No public alert is currently recommended.'}</span></div>
-              )}
+            <div className="command-v4-reasons">
+              <span>ENGINE REASONS</span>
+              {displayEvaluation?.reasons?.length ? displayEvaluation.reasons.map((reason) => <div key={reason}><CheckCircle2 size={14} />{reason}</div>) : <div><Info size={14} /> No detailed reason returned.</div>}
             </div>
-          </aside>
+            <div className="command-v4-evidence-foot"><Database size={14} /> Engine {displayEvaluation?.engine_version ?? 'v1.0'} · evaluated {formatTime(displayEvaluation?.evaluated_at)}</div>
+          </article>
         </section>
 
-        <section id="village-impact-list" className="panel impact-panel">
-          <div className="panel-head">
-            <div><span className="section-kicker">02 / IMPACT ASSESSMENT</span><h2>Affected villages & time to impact</h2></div>
-            <div className="impact-head-meta"><span>{impactAssessments.length} assessed</span><span>{impactAssessments.reduce((sum, item) => sum + (item.population_at_risk ?? 0), 0).toLocaleString('en-IN')} people at risk</span></div>
+        <section className="command-v4-data panel">
+          <div className="command-v4-panel-head">
+            <div><span className="command-v4-kicker">05 / IMPACT ASSESSMENT</span><h2>Affected villages & time to impact</h2></div>
+            <div className="command-v4-impact-actions">
+              <div className="command-v4-head-total"><b>{displayImpactAssessments.length}</b><span>assessed</span><b>{formatNumber(displayPopulationAtRisk)}</b><span>people at risk</span></div>
+              <button className="command-v4-btn primary relay-trigger-btn" onClick={openRelayPicker} disabled={!displayImpactAssessments.length}>
+                <Radio size={14} /> Relay alert
+              </button>
+            </div>
           </div>
-
+          {relayTriggerState && (
+            <div className={`command-v4-relay-status ${relayTriggerState.tone}`} role="status">
+              {relayTriggerState.tone === 'sent' ? <CheckCircle2 size={15} /> : relayTriggerState.tone === 'error' ? <AlertTriangle size={15} /> : <Activity size={15} />}
+              <span>{relayTriggerState.text}</span>
+            </div>
+          )}
           {impactLoading ? (
-            <div className="empty-state"><span className="pulse-dot" /> Loading backend impact assessment…</div>
+            <div className="command-v4-empty"><Activity size={16} /> Loading backend impact assessment…</div>
           ) : impactError ? (
-            <div className="empty-state error-text"><AlertTriangle size={16} /> {impactError}</div>
-          ) : impactAssessments.length ? (
-            <div className="impact-table">
-              <div className="impact-table-head"><span>Village</span><span>Risk</span><span>ETA</span><span>Population</span><span>Downstream</span><span>Delivery</span></div>
-              {zones.map((zone) => {
-                const impact = impactAssessments.find((item) => item.village_id === zone.id)
-                if (!impact) return null
+            <div className="command-v4-empty error"><AlertTriangle size={16} /> {impactError}</div>
+          ) : displayImpactAssessments.length ? (
+            <div className="command-v4-impact-table">
+              <div className="command-v4-impact-head"><span>Village</span><span>Risk</span><span>ETA</span><span>Population</span><span>Downstream</span><span>Delivery</span></div>
+              {displayZones
+                .filter((zone) => displayImpactAssessments.some((impact) => impact.village_id === zone.id))
+                .map((zone) => {
+                  const impact = displayImpactAssessments.find((item) => item.village_id === zone.id)
+                  const zoneRisk = impact?.risk_level ?? zone.risk
+                  const zoneRiskScore = impact?.risk_score ?? zone.riskScore
+                  const zoneEta = impact?.time_to_impact_minutes ?? zone.eta
+                  return (
+                    <button key={zone.id} className={`command-v4-impact-row ${selectedVillageId === zone.id ? 'selected' : ''}`} onClick={() => setSelectedVillageId(zone.id)}>
+                      <span className="village-main"><b>{zone.name}</b><small>{zone.status}</small></span>
+                      <span><strong className={`command-v4-risk-text ${zoneRisk.toLowerCase()}`}>{riskLabel(zoneRisk)}</strong><small>{zoneRiskScore ?? '—'}/100</small></span>
+                      <strong>{formatEta(zoneEta)}</strong>
+                      <strong>{formatNumber(zone.population)}</strong>
+                      <strong>#{impact?.downstream_order ?? zone.downstreamOrder ?? '—'}</strong>
+                      <span><em className="command-v4-assessed">ASSESSED</em><small>Impact engine</small></span>
+                    </button>
+                  )
+                })}
+            </div>
+          ) : (
+            <div className="command-v4-empty"><Info size={16} /> No persisted impact assessment is available for the current alert.</div>
+          )}
+          <div className="command-v4-disclaimer"><Info size={14} /> Impact risk and ETA are backend assessments. The current prototype uses the seeded downstream-order model.</div>
+        </section>
+
+        <section className="command-v4-history panel">
+          <div className="command-v4-panel-head">
+            <div><span className="command-v4-kicker">06 / HISTORICAL DATA</span><h2>Station observation sequence</h2></div>
+            <span>{commandChronologicalHistory.length} stored observations</span>
+          </div>
+          {commandHistoryLoading ? (
+            <div className="command-v4-empty"><Activity size={16} /> Loading historical readings…</div>
+          ) : commandHistoryError ? (
+            <div className="command-v4-empty error"><AlertTriangle size={16} /> {commandHistoryError}</div>
+          ) : (
+            <div className="command-v4-history-list">
+              {commandChronologicalHistory.map((item, index) => {
+                const streamedIndex = streamEntry ? streamEntry.step_index - 1 : null
                 return (
-                  <button key={zone.id} className={'impact-row ' + (selectedVillageId === zone.id ? 'selected' : '')} onClick={() => setSelectedVillageId(zone.id)}>
-                    <span className="impact-village"><span className="village-icon" style={{ color: zone.color }}><CircleDot size={15} /></span><b>{zone.name}</b></span>
-                    <span><span className={'risk ' + zone.risk.toLowerCase()}>{zone.risk}</span><small>{impact.risk_score.toFixed(0)}/100</small></span>
-                    <span className="impact-strong">{formatEta(impact.time_to_impact_minutes)}</span>
-                    <span>{formatNumber(impact.population_at_risk ?? zone.population)}</span>
-                    <span>#{impact.downstream_order ?? '—'}</span>
-                    <span><span className="delivery-chip reached">ASSESSED</span><small>{impact.calculation_method ?? 'Backend impact model'}</small></span>
-                  </button>
+                  <div key={item.id} className={`command-v4-history-row ${streamedIndex === index ? 'active' : ''}`}>
+                    <span>{streamedIndex === index ? 'STREAM' : index === commandChronologicalHistory.length - 1 ? 'LATEST' : `STEP ${index + 1}`}</span>
+                    <b>{item.water_level_m != null ? `${Number(item.water_level_m).toFixed(2)} m` : '—'}</b>
+                    <span>{item.water_level_rate_m_hr != null ? `${Number(item.water_level_rate_m_hr).toFixed(2)} m/hr` : '—'}</span>
+                    <small>{dateTime(item.observed_at)}</small>
+                  </div>
                 )
               })}
             </div>
-          ) : (
-            <div className="empty-state"><Info size={16} /> No persisted impact assessment is available for the current alert yet.</div>
           )}
-
-          <div className="impact-note"><Info size={14} /> Impact ETA and risk are backend assessments. Current prototype ordering uses the seeded downstream-order model and is not a terrain/DEM-derived evacuation forecast.</div>
         </section>
 
         {selectedVillage && (
-          <section className="selected-village panel">
-            <div><span className="section-kicker">SELECTED VILLAGE</span><h2>{selectedVillage.name}</h2></div>
-            <div className="selected-metrics"><span><b>{selectedVillage.risk}</b> risk</span><span><b>{selectedVillage.riskScore ?? '—'}</b> score</span><span><b>{formatEta(selectedVillage.eta)}</b> impact</span><span><b>{formatNumber(selectedVillage.population)}</b> population</span><span><b>{selectedVillage.vulnerability || '—'}</b> vulnerability</span></div>
-            <button className="icon-btn" onClick={() => setSelectedVillageId(null)} aria-label="Close selected village"><X size={16} /></button>
+          <section className="command-v4-selected panel">
+            <div><span className="command-v4-kicker">SELECTED VILLAGE</span><h2>{selectedVillage.name}</h2><p>{selectedVillage.risk} · population {formatNumber(selectedVillage.population)} · vulnerability {selectedVillage.vulnerability ?? '—'}</p></div>
+            <div><b>{selectedVillage.riskScore ?? '—'}</b><span>risk score</span></div>
+            <div><b>{formatEta(selectedVillage.eta)}</b><span>time to impact</span></div>
+            <div><b>{selectedVillage.downstreamOrder ? `#${selectedVillage.downstreamOrder}` : '—'}</b><span>downstream</span></div>
+            <button className="command-v4-btn secondary" onClick={() => setSelectedVillageId(null)}>Close</button>
           </section>
         )}
 
-        </> : activeTab === 'Connectivity' ? <ConnectivityPage riverCode={riverCode} onRiverChange={(nextRiver) => { setRiverCode(nextRiver); setTick(0); setStarted(false) }} /> : <ControlRoomPanel section={activeTab} station={station} reading={reading} latestEvaluation={latestEvaluation} activeAlert={activeAlert} dashboard={dashboard} zones={zones} networks={networks} totalPopulationAtRisk={totalPopulationAtRisk} onReviewAlert={() => { void openAlertReview() }} />
+        </> : activeTab === 'Connectivity' ? <ConnectivityPage riverCode={riverCode} onRiverChange={(nextRiver) => { setRiverCode(nextRiver); setTick(0); setStarted(false) }} /> : activeTab === 'Inbound data' ? <InboundDataPage riverCode={riverCode} onRiverChange={(nextRiver) => setRiverCode(nextRiver)} onRefresh={() => setDataRefreshToken((value) => value + 1)} refreshToken={dataRefreshToken} /> : activeTab === 'Village delivery' ? <VillageDeliveryPage riverCode={riverCode} onRiverChange={(nextRiver) => setRiverCode(nextRiver)} onRefresh={() => setDataRefreshToken((value) => value + 1)} refreshToken={dataRefreshToken} /> : <ControlRoomPanel section={activeTab} station={station} reading={reading} latestEvaluation={latestEvaluation} activeAlert={activeAlert} dashboard={dashboard} zones={zones} networks={networks} totalPopulationAtRisk={totalPopulationAtRisk} onReviewAlert={() => { void openAlertReview() }} />
         )}
       </main>
 
       <footer>
-        <span><span className="pulse-dot" /> Last sync {formatTime(latestEvaluation?.evaluated_at ?? reading?.observed_at)} IST</span>
+        <span><span className="pulse-dot" /> Last sync {formatTime(displayEvaluation?.evaluated_at ?? reading?.observed_at)} IST</span>
         <span>{PRODUCT_NAME} <span className="footer-divider" /> {roleLabel[selectedRole]} workspace <span className="footer-divider" /> v0.2 / field test</span>
       </footer>
+
+      {relayPickerOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={closeRelayPicker}>
+          <section className="modal-card relay-picker-modal" role="dialog" aria-modal="true" aria-labelledby="relay-picker-title" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-head">
+              <div><span className="section-kicker">RELAY DISPATCH / MANUAL OVERRIDE</span><h2 id="relay-picker-title">Relay alert to a village</h2></div>
+              <button className="icon-btn" onClick={closeRelayPicker} disabled={relaySending} aria-label="Close relay picker"><X size={17} /></button>
+            </div>
+
+            <p className="relay-picker-intro">
+              Automatic relay is reserved for villages whose risk score reaches the high-risk threshold.
+              Use this only when automation could not reach a phone, or when an operator must force a retry.
+            </p>
+
+            <div className="relay-picker-auto-note">
+              <ShieldCheck size={15} />
+              <span>
+                Auto-dispatch threshold: <b>70/100</b> ({'≥ 70 = HIGH'}). Villages currently below it are listed for manual override only.
+              </span>
+            </div>
+
+            {relayTriggerState?.tone === 'error' && (
+              <div className="relay-picker-error"><AlertTriangle size={15} /><span>{relayTriggerState.text}</span></div>
+            )}
+
+            <div className="relay-picker-list">
+              {displayZones
+                .filter((zone) => displayImpactAssessments.some((impact) => impact.village_id === zone.id))
+                .map((zone) => {
+                  const impact = displayImpactAssessments.find((item) => item.village_id === zone.id)
+                  const score = impact?.risk_score ?? zone.riskScore ?? 0
+                  const aboveThreshold = score >= 70
+                  return (
+                    <div key={zone.id} className={`relay-picker-row ${aboveThreshold ? 'auto-eligible' : ''}`}>
+                      <div className="relay-picker-village">
+                        <b>{zone.name}</b>
+                        <small>{zone.status} · impact {formatEta(impact?.time_to_impact_minutes ?? zone.eta)}</small>
+                      </div>
+                      <div className="relay-picker-score">
+                        <strong className={`command-v4-risk-text ${riskLabel(impact?.risk_level ?? zone.risk).toLowerCase()}`}>{riskLabel(impact?.risk_level ?? zone.risk)}</strong>
+                        <small>{Math.round(score)}/100</small>
+                      </div>
+                      <span className={`relay-picker-tag ${aboveThreshold ? 'auto' : 'manual'}`}>{aboveThreshold ? 'AUTO-ELIGIBLE' : 'MANUAL ONLY'}</span>
+                      <button className="command-v4-btn primary" onClick={() => void triggerRelay(zone.id)} disabled={relaySending}>
+                        {relaySending ? <Activity size={13} /> : <Radio size={13} />}
+                        Relay
+                      </button>
+                    </div>
+                  )
+                })}
+            </div>
+
+            <div className="approval-note"><ShieldCheck size={16} /><span>The Android relay and hop logic are unchanged. This screen only records the operator's intent; the backend relay endpoint is the next implementation phase.</span></div>
+            <button className="primary-btn modal-close" onClick={closeRelayPicker} disabled={relaySending}><CheckCircle2 size={16} /> Close</button>
+          </section>
+        </div>
+      )}
 
       {alertModalOpen && (
         <div className="modal-backdrop" role="presentation" onClick={() => setAlertModalOpen(false)}>

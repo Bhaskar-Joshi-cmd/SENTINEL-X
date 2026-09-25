@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import {
   AlertTriangle,
   ArrowRight,
@@ -10,8 +10,17 @@ import {
   ShieldCheck,
   Siren,
   Users,
+  XCircle,
 } from 'lucide-react'
-import type { Alert, ImpactAssessment, RuleEvaluation, Station, HydroReading } from './api'
+import {
+  approveAlert,
+  rejectAlert,
+  type Alert,
+  type ImpactAssessment,
+  type RuleEvaluation,
+  type Station,
+  type HydroReading,
+} from './api'
 
 export type DisasterAuthorityZone = {
   id: string
@@ -98,6 +107,31 @@ export default function DisasterAuthorityPage({
   const highestRisk = [...sortedZones].sort((a, b) => (b.riskScore ?? -1) - (a.riskScore ?? -1))[0]
   const nearest = [...impactAssessments].sort((a, b) => a.time_to_impact_minutes - b.time_to_impact_minutes)[0]
   const recommended = Boolean(latestEvaluation?.alert_recommended || activeAlert)
+  const [decisionBusy, setDecisionBusy] = useState<null | 'approve' | 'reject'>(null)
+  const [decisionNote, setDecisionNote] = useState('')
+  const alertReviewed = activeAlert
+    ? ['approved', 'dispatching', 'active', 'cancelled', 'expired'].includes(activeAlert.status)
+    : false
+
+  async function decideAlert(kind: 'approve' | 'reject') {
+    if (!activeAlert || alertReviewed) return
+    setDecisionBusy(kind)
+    setDecisionNote('')
+    try {
+      const response = kind === 'approve'
+        ? await approveAlert(activeAlert.id)
+        : await rejectAlert(activeAlert.id)
+      setDecisionNote(
+        kind === 'approve'
+          ? `Warning authorized (${response.alert.status.replaceAll('_', ' ')}). Impact assessment and last-mile dispatch are now moving through the delivery chain.`
+          : 'Warning package refused by the authority (recorded as cancelled). The rule engine re-evaluates on the next observation and may raise a fresh recommendation.',
+      )
+    } catch (actionError) {
+      setDecisionNote(actionError instanceof Error ? actionError.message : 'Unable to record the authorization decision')
+    } finally {
+      setDecisionBusy(null)
+    }
+  }
 
   return (
     <div className="disaster-authority-page">
@@ -197,6 +231,23 @@ export default function DisasterAuthorityPage({
               <p className="da-alert-copy">{activeAlert.description ?? 'This warning package was generated from the current decision record.'}</p>
               {activeAlert.instruction && <div className="da-instruction"><ShieldCheck size={16} /><span>{activeAlert.instruction}</span></div>}
               <button className="primary-btn" onClick={onReviewAlert}><ShieldCheck size={16} /> Review authorization package <ArrowRight size={15} /></button>
+              <div className="da-authorization-actions">
+                <button
+                  className="primary-btn"
+                  disabled={decisionBusy !== null || alertReviewed}
+                  onClick={() => void decideAlert('approve')}
+                >
+                  <ShieldCheck size={16} /> {decisionBusy === 'approve' ? 'Authorizing…' : 'Approve & dispatch'}
+                </button>
+                <button
+                  className="outline-btn"
+                  disabled={decisionBusy !== null || alertReviewed}
+                  onClick={() => void decideAlert('reject')}
+                >
+                  <XCircle size={16} /> {decisionBusy === 'reject' ? 'Recording…' : 'Reject warning'}
+                </button>
+              </div>
+              {decisionNote && <div className="da-instruction"><ShieldCheck size={16} /><span>{decisionNote}</span></div>}
             </>
           ) : (
             <div className="da-empty-alert">
@@ -205,7 +256,11 @@ export default function DisasterAuthorityPage({
             </div>
           )}
 
-          <div className="da-authorization-note">The dashboard exposes decision readiness; public dispatch remains protected by the authenticated approval flow planned for a later phase.</div>
+          <div className="da-authorization-note">
+            {alertReviewed && activeAlert
+              ? `Alert already ${activeAlert.status.replaceAll('_', ' ')} — the authorization decision is recorded and cannot be repeated for this package.`
+              : 'Authorization is an explicit human decision. Control Room verifies evidence and recommends; only the Disaster Authority can approve or reject official dispatch, and every decision is written to the approval trail.'}
+          </div>
         </section>
       </section>
 

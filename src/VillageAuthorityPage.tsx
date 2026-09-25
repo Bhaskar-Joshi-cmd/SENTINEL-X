@@ -271,21 +271,14 @@ export default function VillageAuthorityPage({ riverCode }: Props) {
 
           <div className="va-main-grid">
             <section className="panel va-hazard-card">
-              <div className="panel-head compact"><div><span className="section-kicker">01 / HAZARD CONTEXT</span><h2>What the local authority is monitoring</h2></div><span className="va-source-chip">{summary.latest_reading?.data_mode?.toUpperCase() ?? 'NO DATA'}</span></div>
+              <div className="panel-head compact"><div><span className="section-kicker">01 / STATION CONTEXT</span><h2>What your village is monitored against</h2></div><span className="va-source-chip">{summary.latest_reading?.data_mode?.toUpperCase() ?? 'NO DATA'}</span></div>
               <div className="va-context-grid">
-                <div><span>River</span><b>{summary.basin.basin_name}</b></div>
                 <div><span>Monitoring station</span><b>{summary.station?.station_name ?? '—'}</b></div>
                 <div><span>Current water level</span><b>{summary.latest_reading?.water_level_m != null ? `${summary.latest_reading.water_level_m.toFixed(2)} m` : '—'}</b></div>
-                <div><span>Rate of rise</span><b>{summary.latest_reading?.water_level_rate_m_hr != null ? `${summary.latest_reading.water_level_rate_m_hr.toFixed(2)} m/hr` : '—'}</b></div>
                 <div><span>Observed</span><b>{formatTime(summary.latest_reading?.observed_at)}</b></div>
-                <div><span>Rule engine</span><b>{summary.latest_evaluation?.engine_version ?? '—'}</b></div>
+                <div><span>Danger threshold</span><b>{summary.station?.danger_level_m != null ? `${summary.station.danger_level_m.toFixed(2)} m` : '—'}</b></div>
               </div>
-              <div className="va-thresholds">
-                <div><span>Warning</span><b>{summary.station?.warning_level_m != null ? `${summary.station.warning_level_m.toFixed(2)} m` : '—'}</b></div>
-                <div><span>Danger</span><b>{summary.station?.danger_level_m != null ? `${summary.station.danger_level_m.toFixed(2)} m` : '—'}</b></div>
-                <div><span>HFL</span><b>{summary.station?.highest_flood_level_m != null ? `${summary.station.highest_flood_level_m.toFixed(2)} m` : '—'}</b></div>
-              </div>
-              <div className="va-rule-note"><Gauge size={16} /><div><b>Decision evidence</b><span>Level {summary.latest_evaluation?.level_score ?? '—'}/60 · Rate {summary.latest_evaluation?.rate_score ?? '—'}/20 · Sensor {summary.latest_evaluation?.sensor_score ?? '—'}/10 · Community {summary.latest_evaluation?.community_score ?? '—'}/5 · Persistence {summary.latest_evaluation?.persistence_score ?? '—'}/5</span></div></div>
+              <div className="va-rule-note"><Gauge size={16} /><div><b>Full evidence stays in Control Room</b><span>Level / rate / sensor / community / persistence breakdown and thresholds live on the Command View. This card shows only your village's monitoring context.</span></div></div>
             </section>
 
             <section className="panel va-alert-card">

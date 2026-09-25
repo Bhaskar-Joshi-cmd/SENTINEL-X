@@ -7,7 +7,6 @@ import {
   ClipboardList,
   CloudOff,
   MapPin,
-  Radio,
   RefreshCw,
   Send,
   Smartphone,
@@ -15,6 +14,7 @@ import {
   Wifi,
 } from 'lucide-react'
 import {
+  acknowledgeDemoWarning,
   getCommunityMemberSummary,
   getCommunityReportOptions,
   getVillages,
@@ -67,8 +67,10 @@ export default function CommunityMemberPage({ riverCode }: Props) {
   const [loadingOptions, setLoadingOptions] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [acknowledged, setAcknowledged] = useState(false)
+  const [ackBusy, setAckBusy] = useState(false)
   const [error, setError] = useState('')
   const [submitState, setSubmitState] = useState('')
+  const [ackState, setAckState] = useState('')
   const [reportType, setReportType] = useState('water_rise')
   const [severity, setSeverity] = useState('moderate')
   const [description, setDescription] = useState('')
@@ -124,8 +126,14 @@ export default function CommunityMemberPage({ riverCode }: Props) {
     setLoadingSummary(true)
     setError('')
     try {
-      setSummary(await getCommunityMemberSummary(villageId))
-      setAcknowledged(false)
+      const response = await getCommunityMemberSummary(villageId)
+      setSummary(response)
+      setAcknowledged(Boolean(response.latest_delivery?.acknowledged_at))
+      setAckState(
+        response.latest_delivery?.acknowledged_at
+          ? `Acknowledged at ${formatDateTime(response.latest_delivery.acknowledged_at)}.`
+          : '',
+      )
       setSubmitState('')
     } catch (loadError) {
       setSummary(null)
@@ -177,6 +185,25 @@ export default function CommunityMemberPage({ riverCode }: Props) {
       setError(submitError instanceof Error ? submitError.message : 'Unable to submit report')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  async function acknowledgeWarning() {
+    if (!summary?.village.id || !hasWarning || acknowledged) return
+    setAckBusy(true)
+    setError('')
+    try {
+      const response = await acknowledgeDemoWarning({
+        village_id: summary.village.id,
+        alert_id: publicAlert?.id ?? null,
+      })
+      setAcknowledged(true)
+      setAckState(`Acknowledged at ${formatDateTime(response.acknowledged_at)}. Stored as a backend delivery record.`)
+      await loadSummary(summary.village.id)
+    } catch (ackError) {
+      setError(ackError instanceof Error ? ackError.message : 'Unable to acknowledge warning')
+    } finally {
+      setAckBusy(false)
     }
   }
 
@@ -257,33 +284,34 @@ export default function CommunityMemberPage({ riverCode }: Props) {
           <div className="cm-grid">
             <section className="panel cm-response-card">
               <div className="panel-head compact"><div><span className="section-kicker">01 / YOUR RESPONSE</span><h2>Warning received?</h2></div></div>
-              <p>{hasWarning ? 'Acknowledge the warning on this demo device so the interface records that you saw it.' : 'There is no active public warning to acknowledge right now.'}</p>
-              <button className={'cm-ack-btn ' + (acknowledged ? 'done' : '')} disabled={!hasWarning || acknowledged} onClick={() => setAcknowledged(true)}>
-                {acknowledged ? <><CheckCircle2 size={17} /> Warning acknowledged on this device</> : <><Bell size={17} /> I received this warning</>}
+              <p>{hasWarning ? 'Acknowledge the warning so a persisted delivery record is stored against this village.' : 'There is no active public warning to acknowledge right now.'}</p>
+              <button className={'cm-ack-btn ' + (acknowledged ? 'done' : '')} disabled={!hasWarning || acknowledged || ackBusy} onClick={() => void acknowledgeWarning()}>
+                {acknowledged ? <><CheckCircle2 size={17} /> {ackState || 'Warning acknowledged'}</> : ackBusy ? <><RefreshCw size={17} className="spin" /> Saving…</> : <><Bell size={17} /> I received this warning</>}
               </button>
-              <div className="cm-response-note"><ShieldIcon /><span>Demo acknowledgement is local UI state for now. A future authenticated version can associate acknowledgement with the signed-in delivery record.</span></div>
+              {!acknowledged && ackState ? <div className="cm-success"><CheckCircle2 size={16} /><span>{ackState}</span></div> : null}
+              <div className="cm-response-note"><ShieldIcon /><span>Acknowledgement is persisted as an <code>alert_deliveries</code> record for this village. Auth will later bind it to the signed-in member.</span></div>
             </section>
 
             <section className="panel cm-condition-card">
-              <div className="panel-head compact"><div><span className="section-kicker">02 / LOCAL CONDITIONS</span><h2>What the system knows</h2></div></div>
+              <div className="panel-head compact"><div><span className="section-kicker">02 / LOCAL WARNING CONTEXT</span><h2>What applies to your village</h2></div></div>
               <div className="cm-condition-grid">
-                <div><span>River</span><b>{summary.basin.basin_name}</b></div>
+                <div><span>Village impact</span><b>{impact ? `${Math.round(impact.risk_score)} · ${titleCase(impact.risk_level)}` : 'Not assessed'}</b></div>
+                <div><span>Time to impact</span><b>{formatEta(impact?.time_to_impact_minutes)}</b></div>
+                <div><span>Alert</span><b>{publicAlert ? `${publicAlert.priority ?? 'P3'} · ${titleCase(publicAlert.status)}` : 'Monitoring'}</b></div>
                 <div><span>Station</span><b>{summary.station?.station_name ?? '—'}</b></div>
-                <div><span>Water level</span><b>{summary.latest_reading?.water_level_m != null ? `${summary.latest_reading.water_level_m.toFixed(2)} m` : '—'}</b></div>
-                <div><span>Observed</span><b>{formatTime(summary.latest_reading?.observed_at)}</b></div>
               </div>
+              <div className="cm-offline-note"><CloudOff size={15} /><span>Full telemetry and engine evidence stay in the Control Room view. This card shows only what your village must act on.</span></div>
             </section>
           </div>
 
           <section className="panel cm-connectivity-card">
-            <div className="panel-head compact"><div><span className="section-kicker">03 / DELIVERY PATH</span><h2>How this village can receive the warning</h2></div></div>
+            <div className="panel-head compact"><div><span className="section-kicker">03 / YOUR REACHABILITY</span><h2>How you will be reached</h2></div></div>
             <div className="cm-channel-grid">
+              <div className={delivery ? 'active' : ''}><Smartphone size={17} /><b>Last delivery</b><span>{delivery ? `${titleCase(delivery.channel)} · ${titleCase(delivery.delivery_status)}` : 'No record yet'}</span></div>
               <div className={summary.village.internet_available ? 'active' : ''}><Wifi size={17} /><b>Internet</b><span>{summary.village.internet_available ? 'Available' : 'Offline'}</span></div>
               <div className={summary.village.cellular_available ? 'active' : ''}><TowerControl size={17} /><b>Cellular</b><span>{summary.village.cellular_available ? 'Available' : 'Offline'}</span></div>
-              <div className={delivery?.channel === 'lora' ? 'active' : ''}><Radio size={17} /><b>Offline relay</b><span>{delivery?.channel === 'lora' ? titleCase(delivery.delivery_status) : 'No recent record'}</span></div>
-              <div className={delivery ? 'active' : ''}><Smartphone size={17} /><b>Last delivery</b><span>{delivery ? titleCase(delivery.delivery_status) : 'No record'}</span></div>
             </div>
-            <div className="cm-offline-note"><CloudOff size={15} /><span>The app does not invent a live network state. Delivery information above comes from stored village delivery records.</span></div>
+            <div className="cm-offline-note"><CloudOff size={15} /><span>Village delivery operations stay in the Control Room workspace. Reachability above comes from stored village delivery records.</span></div>
           </section>
 
           <section className="panel cm-report-card">

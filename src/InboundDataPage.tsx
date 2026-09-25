@@ -13,6 +13,8 @@ import {
 } from 'lucide-react'
 import {
   getInboundSummary,
+  submitSensorReading,
+  reviewCommunityReport,
   type InboundCommunityRecord,
   type InboundEvaluationRecord,
   type InboundHydroRecord,
@@ -140,6 +142,15 @@ export function InboundDataPage({
   const [filter, setFilter] = useState<SourceFilter>('all')
   const [search, setSearch] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState('')
+  const [actionBusyId, setActionBusyId] = useState<string | null>(null)
+  const [sensorCode, setSensorCode] = useState('FIELD-WL-01')
+  const [sensorType, setSensorType] = useState('water_level')
+  const [sensorValue, setSensorValue] = useState('')
+  const [sensorUnit, setSensorUnit] = useState('m')
+  const [sensorKey, setSensorKey] = useState('')
+  const [sensorBusy, setSensorBusy] = useState(false)
+  const [sensorState, setSensorState] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -164,6 +175,63 @@ export function InboundDataPage({
     void load()
     return () => { cancelled = true }
   }, [riverCode, refreshToken])
+
+  async function refreshInbound() {
+    setActionError('')
+    try {
+      const response = await getInboundSummary(riverCode, 50)
+      setData(response)
+    } catch (loadError) {
+      setActionError(loadError instanceof Error ? loadError.message : 'Unable to refresh inbound data')
+    }
+  }
+
+  async function handleVerify(reportId: string, action: 'verified' | 'rejected' | 'request_clarification') {
+    setActionBusyId(reportId)
+    setActionError('')
+    try {
+      await reviewCommunityReport(reportId, { action })
+      await refreshInbound()
+    } catch (verifyError) {
+      setActionError(verifyError instanceof Error ? verifyError.message : 'Unable to update report verification')
+    } finally {
+      setActionBusyId(null)
+    }
+  }
+
+  async function handleSensorSubmit() {
+    const numericValue = Number(sensorValue)
+    if (!sensorCode.trim() || !Number.isFinite(numericValue)) {
+      setSensorState('Enter a sensor code and a numeric reading first.')
+      return
+    }
+    const stationId = data?.sensors.find((item) => item.station_id)?.station_id
+      ?? data?.hydro.find((item) => item.station_id)?.station_id
+      ?? null
+    setSensorBusy(true)
+    setSensorState('')
+    setActionError('')
+    try {
+      await submitSensorReading(
+        {
+          sensor_code: sensorCode.trim(),
+          sensor_type: sensorType,
+          numeric_value: numericValue,
+          unit: sensorUnit.trim() || 'm',
+          station_id: stationId,
+        },
+        sensorKey.trim() || undefined,
+      )
+      setSensorValue('')
+      setSensorState('Sensor reading stored and sent through the rule engine.')
+      await refreshInbound()
+    } catch (sensorError) {
+      setSensorState('')
+      setActionError(sensorError instanceof Error ? sensorError.message : 'Unable to submit sensor reading')
+    } finally {
+      setSensorBusy(false)
+    }
+  }
 
   const rows = useMemo(() => buildRows(data ?? {
     river: { id: '', basin_code: riverCode, basin_name: riverCode },
@@ -266,10 +334,60 @@ export function InboundDataPage({
           ) : (
             <div className="inbound-empty compact-empty">Select a record above to inspect its operational details.</div>
           )}
+          {selectedRow?.source === 'community' && (
+            <div className="inbound-verify-row">
+              <button
+                className="inbound-verify approve"
+                disabled={actionBusyId === selectedRow.id}
+                onClick={() => void handleVerify(selectedRow.id.replace('community-', ''), 'verified')}
+              >
+                {actionBusyId === selectedRow.id ? 'Updating…' : 'Mark verified'}
+              </button>
+              <button
+                className="inbound-verify reject"
+                disabled={actionBusyId === selectedRow.id}
+                onClick={() => void handleVerify(selectedRow.id.replace('community-', ''), 'rejected')}
+              >
+                Mark rejected
+              </button>
+              <button
+                className="inbound-verify clarify"
+                disabled={actionBusyId === selectedRow.id}
+                onClick={() => void handleVerify(selectedRow.id.replace('community-', ''), 'request_clarification')}
+              >
+                Request clarification
+              </button>
+              <span className="inbound-note">This is the Control Room review step. Field confirmation is recorded by the village Community Manager and corroboration by the Village Authority.</span>
+            </div>
+          )}
+          {actionError && <div className="inbound-error compact">{actionError}</div>}
         </section>
 
         <section className="panel inbound-flow-card">
           <div className="inbound-panel-head compact">
+            <div><span className="section-kicker">FIELD SENSOR INGEST</span><h2>Submit a station-linked reading</h2></div>
+          </div>
+          <div className="inbound-sensor-form">
+            <label><span>Sensor code</span><input value={sensorCode} onChange={(event) => setSensorCode(event.target.value)} placeholder="FIELD-WL-01" /></label>
+            <label><span>Type</span>
+              <select value={sensorType} onChange={(event) => setSensorType(event.target.value)}>
+                <option value="water_level">water_level (+10)</option>
+                <option value="seismic">seismic (+5)</option>
+                <option value="vibration">vibration (+5)</option>
+                <option value="camera">camera (+5)</option>
+                <option value="rainfall">rainfall (logged)</option>
+                <option value="other">other (logged)</option>
+              </select>
+            </label>
+            <label><span>Value</span><input value={sensorValue} onChange={(event) => setSensorValue(event.target.value)} placeholder="e.g. 229.4" inputMode="decimal" /></label>
+            <label><span>Unit</span><input value={sensorUnit} onChange={(event) => setSensorUnit(event.target.value)} placeholder="m" /></label>
+            <label><span>Sensor key</span><input value={sensorKey} onChange={(event) => setSensorKey(event.target.value)} placeholder="x-sensor-key (if configured)" /></label>
+          </div>
+          <button className="inbound-verify approve full" disabled={sensorBusy} onClick={() => void handleSensorSubmit()}>
+            {sensorBusy ? 'Submitting…' : 'Submit sensor reading'}
+          </button>
+          {sensorState && <div className="inbound-note positive">{sensorState}</div>}
+          <div className="inbound-panel-head compact" style={{ marginTop: 12 }}>
             <div><span className="section-kicker">PROCESSING CHAIN</span><h2>Where the data goes</h2></div>
           </div>
           <div className="inbound-flow">

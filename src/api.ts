@@ -1,4 +1,10 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000/api'
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ??
+  (typeof window !== 'undefined' &&
+    window.location.hostname !== 'localhost' &&
+    window.location.hostname !== '127.0.0.1'
+    ? '/api'
+    : 'http://127.0.0.1:8000/api')
 
 type ApiEnvelope<T> = T
 
@@ -181,7 +187,7 @@ export function getStations(riverCode: string) {
   return apiRequest<{ river: River; items: Station[] }>(`/rivers/${encodeURIComponent(riverCode)}/stations`)
 }
 
-export function getHydroReadings(stationCode: string, limit = 50) {
+export function getHydroReadings(stationCode: string, limit = 500) {
   return apiRequest<{ station: Station; items: HydroReading[] }>(
     `/hydro/readings?station_code=${encodeURIComponent(stationCode)}&limit=${limit}`,
   )
@@ -213,6 +219,88 @@ export function startReplay(riverCode: string, payload: { station_code?: string;
   return apiRequest<unknown>(`/demo/replay/${encodeURIComponent(riverCode)}`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  })
+}
+
+export type ReplayStepResponse = {
+  river: { id: string; basin_code: string; basin_name: string; river_system?: string | null }
+  station: Station
+  reading: HydroReading
+  evaluation: RuleEvaluation
+  risk_level: string
+  total_score: number
+  alert_recommended: boolean
+  alert_priority?: string | null
+  reasons?: string[] | null
+  alert: Alert | null
+  evidence?: { sensor?: boolean | null; community?: boolean | null } | null
+  impact_assessments: ImpactAssessment[]
+  mode: string
+}
+
+export function replayReadingStep(riverCode: string, stationCode: string, readingId: string) {
+  return apiRequest<ReplayStepResponse>(`/demo/replay/${encodeURIComponent(riverCode)}/step`, {
+    method: 'POST',
+    body: JSON.stringify({ station_code: stationCode, reading_id: readingId }),
+  })
+}
+
+// One automatic streaming tick: the backend advances every station (both
+// basins) to its next chronological historical reading, evaluates it through
+// the rule engine and rebuilds the village impact. Cursor state lives in the
+// DB, so this needs no local replay bookkeeping.
+export type ReplayTickStation = {
+  river_code: string
+  river_name?: string | null
+  station_code: string
+  station_name: string
+  reading: HydroReading
+  evaluation: RuleEvaluation
+  risk_level: string
+  total_score: number
+  alert_recommended: boolean
+  alert_priority?: string | null
+  reasons?: string[] | null
+  alert: Alert | null
+  impact_assessments: ImpactAssessment[]
+  step_index: number
+  total_steps: number
+  error?: string | null
+}
+
+export type ReplayTickResponse = {
+  tick_at: string | null
+  stations: ReplayTickStation[]
+  coalesced?: boolean
+}
+
+export function replayTick() {
+  return apiRequest<ReplayTickResponse>('/demo/replay/tick', { method: 'POST' })
+}
+
+// ---------------------------------------------------------------------------
+// Relay trigger seam.
+//
+// The backend endpoint (POST /api/android/relay-alert) is intentionally not
+// implemented yet — it is the next phase. The Command View calls this so the
+// UI is wired and ready; until the endpoint exists the request fails and the
+// panel reports that honestly rather than faking a success.
+//
+// `source` is 'manual' here. The automatic path ('auto', fired by the stream
+// tick when a village risk crosses the threshold) will reuse the same endpoint.
+// ---------------------------------------------------------------------------
+export type RelayTriggerResult = {
+  alert_id: string
+  village_id: string
+  priority: string
+  message: string
+  hops: number
+}
+
+export function sendRelayAlert(villageId: string, riskScore: number) {
+  return apiRequest<RelayTriggerResult>('/android/relay-alert', {
+    method: 'POST',
+    body: JSON.stringify({ village_id: villageId, source: 'manual', trigger_score: riskScore }),
   })
 }
 
@@ -429,6 +517,13 @@ export function submitDemoCommunityReport(payload: {
   })
 }
 
+export function acknowledgeDemoWarning(payload: { village_id: string; alert_id?: string | null }) {
+  return apiRequest<{ delivery: unknown; acknowledged_at: string }>('/community-member/demo/acknowledge', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export type CommunityReportOption = {
   value: string
   label: string
@@ -448,6 +543,92 @@ export function getVillageAuthoritySummary(villageId: string, reportLimit = 12) 
 
 export function getCommunityReportOptions() {
   return apiRequest<CommunityReportOptions>('/community/options')
+}
+
+export function verifyCommunityReport(
+  reportId: string,
+  payload: { action: 'verified' | 'rejected' | 'request_clarification'; trust_score?: number | null; comments?: string },
+) {
+  return apiRequest<{ report: CommunityReport; evaluation: unknown }>(
+    `/community/demo/reports/${encodeURIComponent(reportId)}/verify`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+export function fieldVerifyCommunityReport(
+  reportId: string,
+  payload: { decision: 'confirmed' | 'disputed'; comments?: string },
+) {
+  return apiRequest<{ report: CommunityReport; evaluation: unknown }>(
+    `/community/demo/reports/${encodeURIComponent(reportId)}/field-verify`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+export function corroborateCommunityReport(
+  reportId: string,
+  payload: { comments?: string },
+) {
+  return apiRequest<{ report: CommunityReport; evaluation: unknown }>(
+    `/community/demo/reports/${encodeURIComponent(reportId)}/corroborate`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+export function reviewCommunityReport(
+  reportId: string,
+  payload: { action: 'verified' | 'rejected' | 'request_clarification'; trust_score?: number | null; comments?: string },
+) {
+  return apiRequest<{ report: CommunityReport; evaluation: unknown }>(
+    `/community/demo/reports/${encodeURIComponent(reportId)}/review`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+export function approveAlert(alertId: string, payload?: { notes?: string }) {
+  return apiRequest<{ alert: Alert }>(`/alerts/demo/${encodeURIComponent(alertId)}/approve`, {
+    method: 'POST',
+    body: JSON.stringify(payload ?? {}),
+  })
+}
+
+export function rejectAlert(alertId: string, payload?: { reason?: string }) {
+  return apiRequest<{ alert: Alert }>(`/alerts/demo/${encodeURIComponent(alertId)}/reject`, {
+    method: 'POST',
+    body: JSON.stringify(payload ?? {}),
+  })
+}
+
+export function submitSensorReading(
+  payload: {
+    sensor_code: string
+    sensor_type: string
+    numeric_value: number
+    unit: string
+    station_id?: string | null
+    battery_percentage?: number | null
+    latitude?: number | null
+    longitude?: number | null
+  },
+  sensorKey?: string,
+) {
+  return apiRequest<{ reading: unknown; evaluation: unknown }>('/sensors/readings', {
+    method: 'POST',
+    headers: sensorKey ? { 'x-sensor-key': sensorKey } : {},
+    body: JSON.stringify({ metadata: {}, ...payload }),
+  })
 }
 
 export function submitDemoVillageReport(payload: {

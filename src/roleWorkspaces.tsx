@@ -11,10 +11,11 @@ import {
 import type { Alert, DashboardSummary, HydroReading, ImpactAssessment, RuleEvaluation, Station } from './api'
 import DisasterAuthorityPage from './DisasterAuthorityPage'
 import VillageAuthorityPage from './VillageAuthorityPage'
+import CommunityManagerPage from './CommunityManagerPage'
 import CommunityMemberPage from './CommunityMemberPage'
 import AdminPage from './AdminPage'
 
-export type RoleKey = 'control_room' | 'disaster_authority' | 'village_authority' | 'community_member' | 'admin'
+export type RoleKey = 'control_room' | 'disaster_authority' | 'village_authority' | 'community_manager' | 'community_member' | 'admin'
 type NetworkKey = 'internet' | 'cellular' | 'mesh'
 type Zone = {
   id: string
@@ -63,7 +64,12 @@ const ROLE_META: Record<RoleKey, { label: string; title: string; description: st
   village_authority: {
     label: 'Village Authority',
     title: 'Local village operations',
-    description: 'Track the village warning, local conditions and the last-mile communication state.',
+    description: 'Designated village / Gram Panchayat / VDMC representative. Corroborate the local situation and coordinate the local response.',
+  },
+  community_manager: {
+    label: 'Community Manager',
+    title: 'Field verification',
+    description: 'Designated trained local field POC / volunteer. Confirm or dispute village reports from the ground.',
   },
   community_member: {
     label: 'Community Member',
@@ -121,6 +127,7 @@ export function RoleWorkspace(props: Props) {
       <WorkspaceHeader role={role} riverCode={props.riverCode} />
       {role === 'disaster_authority' && <DisasterAuthorityPanel {...props} />}
       {role === 'village_authority' && <VillageAuthorityPanel {...props} />}
+      {role === 'community_manager' && <CommunityManagerPanel {...props} />}
       {role === 'community_member' && <CommunityMemberPanel {...props} />}
       {role === 'admin' && <AdminPanel />}
     </div>
@@ -156,6 +163,10 @@ function DisasterAuthorityPanel(props: Props) {
 
 function VillageAuthorityPanel(props: Props) {
   return <VillageAuthorityPage riverCode={props.riverCode} />
+}
+
+function CommunityManagerPanel(props: Props) {
+  return <CommunityManagerPage riverCode={props.riverCode} />
 }
 
 function CommunityMemberPanel(props: Props) {
