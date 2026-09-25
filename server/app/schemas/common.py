@@ -53,7 +53,7 @@ class SensorReadingCreate(BaseModel):
 
 
 class CommunityReportCreate(BaseModel):
-    station_id: UUID
+    station_id: UUID | None = None
     village_id: UUID | None = None
     report_type: ReportType
     severity: Severity
@@ -73,7 +73,33 @@ class ApprovalCreate(BaseModel):
     comments: str | None = Field(default=None, max_length=1000)
 
 
+class CommunityReportVerify(BaseModel):
+    action: Literal["verified", "rejected"]
+    trust_score: float | None = Field(default=None, ge=0, le=1)
+    comments: str | None = Field(default=None, max_length=1000)
+
+
+class CommunityReportFieldVerify(BaseModel):
+    decision: Literal["confirmed", "disputed"]
+    comments: str | None = Field(default=None, max_length=1000)
+
+
+class CommunityReportCorroborate(BaseModel):
+    comments: str | None = Field(default=None, max_length=1000)
+
+
+class CommunityReportReview(BaseModel):
+    action: Literal["verified", "rejected", "request_clarification"]
+    trust_score: float | None = Field(default=None, ge=0, le=1)
+    comments: str | None = Field(default=None, max_length=1000)
+
+
+class ReplayStepRequest(BaseModel):
+    station_code: str
+    reading_id: UUID
+
+
 class ReplayRequest(BaseModel):
     station_code: str | None = None
-    limit: int = Field(default=20, ge=1, le=100)
+    limit: int = Field(default=500, ge=1, le=500)
     delay_seconds: float = Field(default=0, ge=0, le=10)

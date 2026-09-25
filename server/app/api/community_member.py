@@ -65,7 +65,7 @@ def _latest_reading(station_id: str | None) -> dict | None:
 
 
 @router.get("/summary")
-async def summary(village_id: UUID = Query(...)):
+def summary(village_id: UUID = Query(...)):
     """Demo village-scoped read model. Auth will later supply village_id from user_profiles."""
     admin = get_admin_client()
     village = _village(village_id)
@@ -156,7 +156,7 @@ async def summary(village_id: UUID = Query(...)):
 
 
 @router.post("/demo/reports")
-async def create_demo_report(payload: CommunityReportCreate):
+def create_demo_report(payload: CommunityReportCreate):
     """Demo-only community write path using the canonical community_reports table and rule engine."""
     admin = get_admin_client()
     if not payload.village_id:
@@ -203,3 +203,70 @@ async def create_demo_report(payload: CommunityReportCreate):
     report = report_response.data[0]
     evaluation = evaluate_community_report(report)
     return {"report": report, "evaluation": evaluation}
+
+
+@router.post("/demo/acknowledge")
+def acknowledge_demo_warning(payload: dict):
+    """Demo-only persisted acknowledgement (replaces local-only UI state)."""
+    admin = get_admin_client()
+    village_id = payload.get("village_id") if isinstance(payload, dict) else None
+    alert_id = payload.get("alert_id") if isinstance(payload, dict) else None
+    if not village_id:
+        raise HTTPException(400, "village_id is required to acknowledge a warning")
+    now = datetime.now(timezone.utc).isoformat()
+    target_rows = (
+        admin.table("alert_targets")
+        .select("alert_id")
+        .eq("village_id", str(village_id))
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    resolved_alert_id = alert_id or (target_rows[0].get("alert_id") if target_rows else None)
+    if not resolved_alert_id:
+        raise HTTPException(400, "No alert exists for this village yet; nothing to acknowledge")
+    rows = (
+        admin.table("alert_deliveries")
+        .select("id")
+        .eq("village_id", str(village_id))
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if rows:
+        updated = (
+            admin.table("alert_deliveries")
+            .update({"acknowledged_at": now, "delivery_status": "acknowledged"})
+            .eq("id", rows[0]["id"])
+            .select("*")
+            .execute()
+            .data
+            or []
+        )
+        return {"delivery": updated[0] if updated else None, "acknowledged_at": now}
+    created = (
+        admin.table("alert_deliveries")
+        .insert(
+            {
+                "alert_id": resolved_alert_id,
+                "village_id": str(village_id),
+                "channel": "app_push",
+                "delivery_status": "acknowledged",
+                "attempt_number": 1,
+                "sent_at": now,
+                "delivered_at": now,
+                "acknowledged_at": now,
+                "is_simulated": True,
+                "metadata": {"demo": True, "demo_context": "community_member_ack"},
+            }
+        )
+        .select("*")
+        .execute()
+        .data
+        or []
+    )
+    return {"delivery": created[0] if created else None, "acknowledged_at": now}

@@ -2,3 +2,9 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 supabase>=2.6,<3.0
 pydantic-settings>=2.6,<3.0
+
+# Testing
+pytest>=8.0,<9.0
+
+# NOTE: convenience mirror of server/requirements.txt, which is the
+# authoritative backend dependency list. Keep both in sync.

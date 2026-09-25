@@ -74,7 +74,7 @@ def _latest_evaluation(station_id: str | None, reading_id: str | None) -> dict |
 
 
 @router.get("/summary")
-async def summary(village_id: UUID = Query(...), report_limit: int = Query(default=12, ge=1, le=50)):
+def summary(village_id: UUID = Query(...), report_limit: int = Query(default=12, ge=1, le=50)):
     """Demo-compatible village-scoped summary. Auth will later supply village_id server-side."""
     admin = get_admin_client()
     village = _village(village_id)
@@ -137,7 +137,7 @@ async def summary(village_id: UUID = Query(...), report_limit: int = Query(defau
 
 
 @router.post("/demo/reports")
-async def create_demo_report(payload: CommunityReportCreate):
+def create_demo_report(payload: CommunityReportCreate):
     """Demo-only write path: same community_reports shape and same rule-engine evaluation."""
     admin = get_admin_client()
     if not payload.village_id:

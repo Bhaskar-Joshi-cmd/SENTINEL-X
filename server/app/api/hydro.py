@@ -6,7 +6,7 @@ router = APIRouter(prefix="/hydro", tags=["Hydrology"])
 
 
 @router.get("/readings")
-async def readings(
+def readings(
     station_code: str = Query(...),
     limit: int = Query(default=50, ge=1, le=500),
 ):

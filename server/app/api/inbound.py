@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from functools import partial
+
 from fastapi import APIRouter, HTTPException, Query
 
 from app.db.supabase import get_admin_client
@@ -34,32 +37,39 @@ async def inbound_summary(
     """
     admin = get_admin_client()
     code = river_code.upper().strip()
+    # Independent Supabase reads run concurrently in threads (the sync
+    # supabase-py client blocks its thread, so executor overlap removes the
+    # serial queueing that caused multi-second stalls on river switch).
+    loop = asyncio.get_running_loop()
 
-    basin_rows = (
-        admin.table("basins")
-        .select("*")
-        .eq("basin_code", code)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
+    def q_basins():
+        return admin.table("basins").select("*").eq("basin_code", code).limit(1).execute().data or []
+
+    basin_rows = await loop.run_in_executor(None, q_basins)
     if not basin_rows:
         raise HTTPException(status_code=404, detail="River not found")
 
     basin = basin_rows[0]
+    basin_id = basin["id"]
 
-    stations = (
-        admin.table("hydro_stations")
-        .select("*")
-        .eq("basin_id", basin["id"])
-        .order("station_name")
-        .execute()
-        .data
-        or []
+    def q_stations():
+        return admin.table("hydro_stations").select("*").eq("basin_id", basin_id).order("station_name").execute().data or []
+
+    def q_devices():
+        return admin.table("sensor_devices").select("*").execute().data or []
+
+    def q_villages():
+        return admin.table("villages").select("*").eq("basin_id", basin_id).execute().data or []
+
+    stations, devices, villages = await asyncio.gather(
+        loop.run_in_executor(None, q_stations),
+        loop.run_in_executor(None, q_devices),
+        loop.run_in_executor(None, q_villages),
     )
     station_ids = [str(row["id"]) for row in stations if row.get("id")]
     station_map = {str(row["id"]): row for row in stations if row.get("id")}
+    device_map = {str(row.get("id")): row for row in devices if row.get("id")}
+    village_map = {str(row.get("id")): row.get("village_name") for row in villages if row.get("id")}
 
     hydro: list[dict] = []
     source_errors: list[dict] = []
@@ -109,9 +119,9 @@ async def inbound_summary(
     try:
         sensor_rows = (
             admin.table("sensor_readings")
-            .select("*")
+            .select("id,sensor_id,observed_at,numeric_value,unit,battery_percentage,latitude,longitude,quality_score,raw_data,created_at")
             .order("observed_at", desc=True)
-            .limit(min(limit * 5, 250))
+            .limit(min(limit, 50))
             .execute()
             .data
             or []
@@ -123,7 +133,7 @@ async def inbound_summary(
             if not isinstance(raw, dict):
                 raw = {}
 
-            linked_station_id = raw.get("station_id") or row.get("station_id")
+            linked_station_id = raw.get("station_id")
             if not linked_station_id or str(linked_station_id) not in station_id_set:
                 continue
 
@@ -209,9 +219,9 @@ async def inbound_summary(
         # the newest hydro records have not been evaluated yet.
         evaluation_rows = (
             admin.table("rule_evaluations")
-            .select("*")
+            .select("id,hydro_reading_id,sensor_reading_id,community_report_id,event_id,total_score,risk_level,alert_recommended,alert_priority,reasons,evaluated_at")
             .order("evaluated_at", desc=True)
-            .limit(min(limit * 3, 150))
+            .limit(min(limit, 40))
             .execute()
             .data
             or []

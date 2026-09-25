@@ -40,30 +40,35 @@ async def approve_alert(
             f"'{alert['status']}'"
         )
 
-    # The API already restricts approval to:
-    # control_room / disaster_authority / admin.
+    # The API already restricts approval to the authorized
+    # Disaster Authority (DDMA-side) / admin. The Control Room
+    # verifies and recommends but never approves official alerts.
     if user.get("role") not in {
-        "control_room",
         "disaster_authority",
         "admin",
     }:
         raise PermissionError(
-            "Only authorized control-room/disaster roles "
-            "can approve alert dispatch"
+            "Only the authorized Disaster Authority "
+            "can approve official alert dispatch"
         )
 
     now = datetime.now(timezone.utc).isoformat()
 
+    # Demo mode may run without a seeded profile row, so the actor id is
+    # optional; the authenticated path always supplies one.
+    actor_id = (user or {}).get("id")
+
+    approve_payload: dict = {
+        "status": "approved",
+        "approved_at": now,
+    }
+    if actor_id:
+        approve_payload["approved_by"] = actor_id
+
     # Mark the alert as approved.
     updated_response = (
         admin.table("alerts")
-        .update(
-            {
-                "status": "approved",
-                "approved_by": user["id"],
-                "approved_at": now,
-            }
-        )
+        .update(approve_payload)
         .eq("id", str(alert_id))
         .select("*")
         .execute()
@@ -77,14 +82,19 @@ async def approve_alert(
     updated_alert = updated_response.data[0]
 
     # Record the approval action.
-    admin.table("alert_approvals").insert(
-        {
-            "alert_id": str(alert_id),
-            "user_id": user["id"],
-            "action": "approved",
-            "comments": comments,
-        }
-    ).execute()
+    if actor_id:
+        try:
+            admin.table("alert_approvals").insert(
+                {
+                    "alert_id": str(alert_id),
+                    "user_id": actor_id,
+                    "action": "approved",
+                    "comments": comments,
+                }
+            ).execute()
+        except Exception:
+            # Demo seeds may not include a matching profile row.
+            pass
 
     # Make sure impact assessments exist.
     await ensure_impact_assessment(

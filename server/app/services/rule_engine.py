@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -65,6 +66,108 @@ def _hazard_from_report(report_type: str) -> str:
     if report_type == "avalanche":
         return "avalanche"
     return "unknown"
+
+
+# Locked hierarchy amendment: minimal verification vocabulary.
+# submitted (+ legacy pending alias), field_confirmed, not_confirmed,
+# corroborated, verified, rejected. 'incorporated' is NOT a human state —
+# incorporation is represented by event/score/evaluation records.
+VALID_EVIDENCE_STATUSES = {
+    "submitted",
+    "pending",
+    "field_confirmed",
+    "corroborated",
+    "verified",
+}
+
+# Community ladder weights (max stays 5/100): first report +1, second
+# independent reporter +1, manager field confirmation +2, VA corroboration +1.
+COMMUNITY_EVIDENCE_MAX = 5.0
+
+# Safety cap on how many reports one event window may contribute to the
+# ladder (mirrors _event_window_reports; applied again after merging an
+# explicitly supplied report).
+COMMUNITY_WINDOW_REPORT_CAP = 20
+
+
+def _identity_of(row: dict) -> str | None:
+    """Stable reporter identity for independence checks (auth or demo)."""
+    reporter = row.get("reporter_user_id")
+    if reporter:
+        return f"user:{reporter}"
+    metadata = row.get("metadata") or {}
+    for key in ("reporter_identity", "demo_identity", "submitted_via", "demo_context"):
+        value = metadata.get(key)
+        if value:
+            return f"demo:{value}:{row.get('village_id')}:{row.get('report_type')}"
+    return None
+
+
+def _community_ladder(reports: list[dict]) -> tuple[float, list[str]]:
+    """Grade community evidence 0..5 from the current event window.
+
+    Ladder: +1 first valid hazard report (a single isolated report is never
+    ignored), +1 second independent reporter, +2 Community Manager field
+    confirmation by a third person, +1 Village Authority corroboration.
+    The same person never counts twice: a manager confirming their own
+    report adds nothing.
+    """
+    valid = [
+        row
+        for row in reports
+        if str(row.get("report_type") or "") in {"flood", "water_rise", "landslide", "avalanche"}
+        and str(row.get("verification_status") or "") in VALID_EVIDENCE_STATUSES
+    ]
+    if not valid:
+        return 0.0, []
+    # Newest first so the freshest evidence wins ties.
+    valid.sort(key=lambda row: str(row.get("submitted_at") or ""), reverse=True)
+
+    score = 1.0
+    reasons = [f"Community evidence: {valid[0].get('report_type')} report ({valid[0].get('verification_status')})"]
+    seen: set[str] = set()
+    first_identity = _identity_of(valid[0])
+    if first_identity:
+        seen.add(first_identity)
+
+    # Second independent reporter.
+    second = None
+    for row in valid[1:]:
+        identity = _identity_of(row)
+        if identity and identity in seen:
+            continue
+        second = row
+        if identity:
+            seen.add(identity)
+        break
+    if second is not None:
+        score += 1.0
+        reasons.append("Second independent reporter nearby")
+
+    # Manager field confirmation by someone other than the reporters.
+    confirmed = False
+    for row in valid:
+        if str(row.get("verification_status") or "") != "field_confirmed":
+            continue
+        metadata = row.get("metadata") or {}
+        confirmer = metadata.get("verified_by") or metadata.get("field_verified_by")
+        confirmer_key = f"user:{confirmer}" if confirmer else _identity_of(row)
+        if confirmer_key and confirmer_key in seen:
+            continue
+        confirmed = True
+        if confirmer_key:
+            seen.add(confirmer_key)
+        break
+    if confirmed:
+        score += 2.0
+        reasons.append("Community Manager field confirmation")
+
+    # Village Authority corroboration.
+    if any(str(row.get("verification_status") or "") == "corroborated" for row in valid):
+        score += 1.0
+        reasons.append("Village Authority corroboration")
+
+    return round(min(score, COMMUNITY_EVIDENCE_MAX), 2), reasons
 
 
 def _find_or_create_event(station: dict, hazard_type: str) -> dict:
@@ -186,6 +289,158 @@ def _get_recent_community_report(station_id: UUID | str) -> dict | None:
     return None
 
 
+def get_station_evidence(station: dict) -> tuple[dict | None, dict | None]:
+    """Latest sensor + community evidence for a station (replay/live parity).
+
+    Returns (sensor_reading, community_report); either may be None when no
+    evidence exists, in which case the engine scores that factor as 0
+    (existing engine behavior — no defaults are invented).
+
+    Community reports carry village_id (no station_id column), so they are
+    linked through villages in the station's basin.
+    """
+    admin = get_admin_client()
+    station_id = station.get("id")
+
+    sensor: dict | None = _get_recent_confirming_sensor(station_id)
+    if sensor:
+        sensor_type = None
+        sensor_id = sensor.get("sensor_id")
+        if sensor_id:
+            device_rows = (
+                admin.table("sensor_devices")
+                .select("sensor_type")
+                .eq("id", str(sensor_id))
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if device_rows:
+                sensor_type = device_rows[0].get("sensor_type")
+        sensor = dict(sensor)
+        sensor["sensor_type"] = sensor_type
+        raw = dict(sensor.get("raw_data") or {})
+        raw["station_id"] = str(station_id)
+        raw["sensor_code"] = raw.get("sensor_code", sensor.get("sensor_code"))
+        sensor["raw_data"] = raw
+
+    community: dict | None = None
+    basin_id = station.get("basin_id")
+    if basin_id:
+        villages = (
+            admin.table("villages")
+            .select("id")
+            .eq("basin_id", str(basin_id))
+            .execute()
+            .data
+            or []
+        )
+        village_ids = [str(v["id"]) for v in villages if v.get("id")]
+        if village_ids:
+            rows = (
+                admin.table("community_reports")
+                .select("*")
+                .in_("village_id", village_ids)
+                .order("submitted_at", desc=True)
+                .limit(5)
+                .execute()
+                .data
+                or []
+            )
+            for row in rows:
+                status = str(row.get("verification_status") or "submitted").lower()
+                if status in VALID_EVIDENCE_STATUSES:
+                    community = row
+                    break
+
+    return sensor, community
+
+
+# Community evidence stays valid for the whole event window, not just the
+# slice between two evaluations. Without this, a report dropped out of scope
+# on the very next 10 s tick and field confirmation could never be counted.
+COMMUNITY_WINDOW_HOURS = 6
+
+
+def _event_window_start(admin, station: dict) -> str | None:
+    """Start of the current community evidence window for this station's basin.
+
+    Prefers the live hazard event (its ``created_at``), so graded community
+    evidence accumulates across the 10 s replay/live evaluation stream while
+    still being bounded to the current event. Falls back to a rolling window
+    when no event row exists yet.
+    """
+    basin_id = station.get("basin_id")
+    if basin_id:
+        try:
+            rows = (
+                admin.table("events")
+                .select("created_at,status")
+                .eq("basin_id", str(basin_id))
+                .in_("status", ["monitoring", "active", "confirmed"])
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if rows and rows[0].get("created_at"):
+                return str(rows[0]["created_at"])
+        except Exception:
+            pass
+    return (datetime.now(timezone.utc) - timedelta(hours=COMMUNITY_WINDOW_HOURS)).isoformat()
+
+
+def _event_window_reports(admin, station: dict, hydro: dict, limit: int = 20) -> list[dict]:
+    """Reports scoped to the current event window (safety-capped at 20).
+
+    The window start comes from the active hazard event for this basin, so a
+    report keeps contributing when the Community Manager confirms it or the
+    Village Authority corroborates it on a later tick. Village-scoped reports
+    with no station still count when the village belongs to this station's
+    basin (landslide/road-block case).
+    """
+    station_id = str(station.get("id"))
+    basin_id = station.get("basin_id")
+    window_start = _event_window_start(admin, station)
+    try:
+        query = (
+            admin.table("community_reports")
+            .select("*")
+            .order("submitted_at", desc=True)
+            .limit(limit * 3)
+        )
+        if window_start:
+            query = query.gte("submitted_at", window_start)
+        rows = query.execute().data or []
+    except Exception:
+        return []
+    basin_villages: set[str] | None = None
+    if basin_id:
+        try:
+            villages = (
+                admin.table("villages")
+                .select("id")
+                .eq("basin_id", str(basin_id))
+                .execute()
+                .data
+                or []
+            )
+            basin_villages = {str(v.get("id")) for v in villages if v.get("id")}
+        except Exception:
+            basin_villages = None
+    scoped: list[dict] = []
+    for row in rows:
+        if str(row.get("station_id") or "") == station_id:
+            scoped.append(row)
+        elif not row.get("station_id") and basin_villages is not None and str(row.get("village_id") or "") in basin_villages:
+            scoped.append(row)
+        if len(scoped) >= limit:
+            break
+    return scoped
+
+
 def evaluate_hydro_reading(
     hydro_reading: dict,
     sensor_reading: dict | None = None,
@@ -193,6 +448,18 @@ def evaluate_hydro_reading(
     create_alert: bool = True,
 ) -> dict:
     station = _get_station(hydro_reading["station_id"])
+
+    # Replay/live parity: when the caller does not pass explicit sensor or
+    # community evidence, pull the latest rows recorded for this station so
+    # every evaluation (including historical replay) scores the same factors.
+    # Missing evidence returns None and simply scores that factor as 0 —
+    # no defaults are invented.
+    if sensor_reading is None or community_report is None:
+        db_sensor, db_community = get_station_evidence(station)
+        if sensor_reading is None:
+            sensor_reading = db_sensor
+        if community_report is None:
+            community_report = db_community
 
     level = _safe_float(hydro_reading.get("water_level_m"))
     rate = _safe_float(hydro_reading.get("water_level_rate_m_hr"))
@@ -217,16 +484,23 @@ def evaluate_hydro_reading(
             sensor_score = 5.0
 
     community_score = 0.0
+    community_reasons: list[str] = []
+    community_window_size = 0
 
-    if community_report:
-        report_type = community_report.get("report_type")
-        verification_status = community_report.get("verification_status")
-
-        if (
-            report_type in {"flood", "water_rise", "landslide", "avalanche"}
-            and verification_status == "verified"
-        ):
-            community_score = 5.0
+    # --- Community evidence -------------------------------------------
+    # Graded ladder over the current event window (max 5/100). A single
+    # isolated report still counts (+1) so an isolated village is never
+    # ignored; rejected / not_confirmed rows are skipped. An explicitly
+    # supplied report is merged into the window so the submit-time score and
+    # the 10 s tick score always agree.
+    window_reports = _event_window_reports(get_admin_client(), station, hydro_reading)
+    if community_report is not None:
+        known_ids = {str(row.get("id")) for row in window_reports}
+        if str(community_report.get("id")) not in known_ids:
+            window_reports = [community_report, *window_reports]
+    window_reports = window_reports[:COMMUNITY_WINDOW_REPORT_CAP]
+    community_score, community_reasons = _community_ladder(window_reports)
+    community_window_size = len(window_reports)
 
     previous = _get_previous_hydro_rows(
     hydro_reading["station_id"],
@@ -242,6 +516,9 @@ def evaluate_hydro_reading(
     risk_level, priority, alert_recommended = _risk(total)
 
     reasons: list[str] = []
+    # Community ladder notes are produced before the hydro/sensor scores are
+    # assembled, so they are merged in here (never before `reasons` exists).
+    reasons.extend(community_reasons)
     if level_score > 0:
         reasons.append(f"River level contributes {level_score:.1f}/60")
     if rate_score > 0:
@@ -299,6 +576,7 @@ def evaluate_hydro_reading(
             "hydro_reading": hydro_reading,
             "sensor_reading": sensor_reading,
             "community_report": community_report,
+            "community_window_size": community_window_size,
         },
     }
     evaluation_response = (
@@ -400,9 +678,54 @@ def evaluate_sensor_reading(
     )
 
 
+def _station_for_village(admin, village_id: str | None) -> str | None:
+    """First station of the village's basin (fallback for station-less reports).
+
+    Landslide / road-block reports intentionally carry no station, but they
+    still need a hydro context before they can be scored.
+    """
+    if not village_id:
+        return None
+    try:
+        village_rows = (
+            admin.table("villages")
+            .select("basin_id")
+            .eq("id", str(village_id))
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return None
+    basin_id = village_rows[0].get("basin_id") if village_rows else None
+    if not basin_id:
+        return None
+    try:
+        station_rows = (
+            admin.table("hydro_stations")
+            .select("id")
+            .eq("basin_id", str(basin_id))
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return None
+    return str(station_rows[0]["id"]) if station_rows else None
+
+
 def evaluate_community_report(report: dict) -> dict:
-    station_id = report["station_id"]
     admin = get_admin_client()
+    station_id = report.get("station_id") or _station_for_village(admin, report.get("village_id"))
+    if not station_id:
+        # Stored, but there is no station context to score it against.
+        return {
+            "evaluated": False,
+            "report_id": report.get("id"),
+            "reason": "No station could be linked to this report; stored without a rule evaluation.",
+        }
     hydro_rows = (
         admin.table("hydro_readings")
         .select("*")

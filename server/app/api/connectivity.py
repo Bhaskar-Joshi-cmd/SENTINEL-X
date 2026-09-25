@@ -53,7 +53,7 @@ def _route_from_rows(rows: list[dict]) -> str | None:
 
 
 @router.get("/summary")
-async def summary(river_code: str):
+def summary(river_code: str):
     admin = get_admin_client()
     code = river_code.upper()
 
@@ -126,7 +126,7 @@ async def summary(river_code: str):
             .in_("alert_id", basin_alert_ids)
             .in_("village_id", village_ids)
             .order("created_at", desc=True)
-            .limit(500)
+            .limit(200)
             .execute()
             .data
             or []

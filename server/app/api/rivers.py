@@ -6,13 +6,13 @@ router = APIRouter(prefix="/rivers", tags=["Rivers"])
 
 
 @router.get("")
-async def list_rivers():
+def list_rivers():
     rows = get_admin_client().table("basins").select("*").in_("basin_code", ["TEESTA", "DESANG"]).order("basin_name").execute().data or []
     return {"items": rows}
 
 
 @router.get("/{river_code}/stations")
-async def list_stations(river_code: str):
+def list_stations(river_code: str):
     basin = (
         get_admin_client().table("basins")
         .select("id,basin_code,basin_name,river_system")
@@ -36,7 +36,7 @@ async def list_stations(river_code: str):
 
 
 @router.get("/{river_code}/villages")
-async def list_villages(river_code: str):
+def list_villages(river_code: str):
     basin = (
         get_admin_client().table("basins")
         .select("id,basin_code,basin_name")
